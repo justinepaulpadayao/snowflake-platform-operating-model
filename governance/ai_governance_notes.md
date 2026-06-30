@@ -105,8 +105,7 @@ revalidation; record decision, approver, and date; log incidents and near-misses
 ## 5. Using AI personally while validating correctness and avoiding risk
 
 You are accountable for anything you ship with AI help. The AI is a fast junior assistant, not an
-authority. *(This is the same discipline our `phi-safe-authoring` and `snowflake-doc-grounding`
-engineering skills enforce at the artifact level.)*
+authority.
 
 **Protect data/secrets (every prompt):** approved tools for work content; sanitize before pasting
 (no PHI, no secrets, no internal hostnames, no real rows — use synthetic/genericized examples);

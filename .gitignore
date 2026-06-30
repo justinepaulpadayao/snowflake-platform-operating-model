@@ -29,5 +29,23 @@ credentials.*
 docs/superpowers/
 docs/standards/
 
+# dbt artifacts
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+dbt/packages/
+dbt/profiles.yml      # live profiles contain key-pair paths; example is tracked
+
+# Terraform state + provider cache
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars              # live var files contain secrets; variables.tf is tracked
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Source brief / external docs that must never be published
 *Assessment*.md

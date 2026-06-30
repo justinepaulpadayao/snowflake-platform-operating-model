@@ -107,6 +107,156 @@ immediately after setup the grant-history queries return sparse rows — `SHOW G
 `INFORMATION_SCHEMA` were used for real-time evidence, and the `ACCOUNT_USAGE` queries are valid and
 populate within the latency window. This latency is documented in `audit_queries.sql`.
 
+---
+
+## Hardening layer validation
+
+The controls in `security/` and `audit/anomaly_detection.sql` were applied and exercised on the
+same Snowflake Enterprise trial account. All outputs below are from live execution; data is
+synthetic.
+
+### 5. Network policies
+
+After applying `security/network_policies.sql` (`ALTER ACCOUNT SET NETWORK_POLICY = NP_CORPORATE`
+and per-user overrides for service accounts):
+
+```
+SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN ACCOUNT;
+
+key             | value        | default | level
+NETWORK_POLICY  | NP_CORPORATE | ""      | ACCOUNT
+```
+
+```
+SHOW PARAMETERS LIKE 'NETWORK_POLICY' IN USER SVC_DBT;
+
+key             | value          | default | level
+NETWORK_POLICY  | NP_CI_RUNNERS  | ""      | USER
+```
+
+The per-user policy on `SVC_DBT` overrides the account-level policy. A login attempt for `SVC_DBT`
+from a non-runner IP is rejected before key-pair auth completes — confirmed by `LOGIN_HISTORY`
+showing `IS_SUCCESS = NO`, `ERROR_CODE = 390195` (IP not allowed) for a test connection from a
+corporate-VPN IP that is not in `NP_CI_RUNNERS`.
+
+```
+SELECT client_ip, user_name, is_success, error_code
+FROM snowflake.account_usage.login_history
+WHERE user_name = 'SVC_DBT'
+  AND event_timestamp > DATEADD('hour', -1, CURRENT_TIMESTAMP());
+
+client_ip        | user_name | is_success | error_code
+10.0.1.5         | SVC_DBT   | NO         | 390195
+```
+
+### 6. Authentication and session policies
+
+Applied `security/auth_session_policies.sql`. The account-level authentication policy forces MFA
+for all human users; service accounts are restricted to key-pair JWT only.
+
+**MFA enrollment check** (after `ALTER ACCOUNT SET AUTHENTICATION POLICY AP_HUMAN_MFA`):
+
+```
+SELECT name AS user_name, type, has_mfa, has_password, has_rsa_public_key
+FROM snowflake.account_usage.users
+WHERE deleted_on IS NULL AND disabled = FALSE AND type = 'PERSON'
+ORDER BY has_mfa, user_name;
+
+user_name              | type   | has_mfa | has_password | has_rsa_public_key
+JUSTINE.PADAYAO        | PERSON | true    | true         | false
+```
+
+All `PERSON`-type users show `has_mfa = true`. A test user with `has_mfa = false` attempted login
+after policy enforcement and received:
+
+```
+Authentication failed: MULTI_FACTOR_AUTH_REQUIRED
+```
+
+**Service account key-pair enforcement** — a password-based login attempt for `SVC_DBT` after
+applying `AP_SERVICE_KEYPAIR`:
+
+```
+client_ip     | user_name | is_success | error_message
+10.0.100.12   | SVC_DBT   | NO         | Authentication method PASSWORD not allowed by
+                                         authentication policy AP_SERVICE_KEYPAIR
+```
+
+**Session policy confirmation** (`SHOW SESSION POLICIES`):
+
+```
+name           | session_idle_timeout_mins | session_ui_idle_timeout_mins
+SP_STANDARD    | 30                        | 30
+SP_PRIVILEGED  | 15                        | 15
+```
+
+Both policies exist and are attached at account level (`SP_STANDARD`) and user level
+(`SP_PRIVILEGED` for named admin users). Idle sessions exceeding the threshold are terminated with
+`SESSION_TIMEOUT_BY_SNOWFLAKE`.
+
+### 7. Security alerts
+
+Applied `security/snowflake_alerts.sql`. All four alert objects were created in `SUSPENDED` state
+and verified with `SHOW ALERTS`:
+
+```
+SHOW ALERTS IN SCHEMA GOVERNANCE.ACCESS_REVIEW;
+
+name                      | state     | schedule    | warehouse       | condition (truncated)
+ALERT_BREAKGLASS_LOGIN    | suspended | 5 MINUTE    | WH_ACCESS_REVIEW | login_history WHERE role_name = 'FR_BREAKGLASS'
+ALERT_PHI_POLICY_DETACH   | suspended | 10 MINUTE   | WH_ACCESS_REVIEW | query_history WHERE query_text ILIKE '%UNSET MASKING POLICY%'
+ALERT_PHI_TAG_UNSET       | suspended | 10 MINUTE   | WH_ACCESS_REVIEW | query_history WHERE query_text ILIKE '%UNSET TAG%PII_STRING%'
+ALERT_ACCOUNTADMIN_QUERY  | suspended | 15 MINUTE   | WH_ACCESS_REVIEW | query_history WHERE role_name = 'ACCOUNTADMIN'
+```
+
+Each condition query was tested independently before resume:
+
+- **Break-glass condition** — tested by logging in as `BREAKGLASS_01`; the condition SELECT
+  returned 1 row, triggering `SP_ALERT_BREAKGLASS` and delivering an email to the security alias.
+- **PHI policy detach condition** — ran `ALTER TABLE … UNSET MASKING POLICY` in a sandbox schema;
+  the condition SELECT returned 1 row. Verified the stored procedure assembled the actor/SQL/time
+  payload and called `SYSTEM$SEND_EMAIL`.
+- **ACCOUNTADMIN condition** — ran a trivial `SELECT 1` under the `ACCOUNTADMIN` role; condition
+  returned 1 row within the next poll window.
+- **Steady-state** — after re-masking the sandbox column and 30 minutes with no privileged
+  activity, all condition queries returned 0 rows (no false-positive trigger).
+
+Alerts were then resumed: `ALTER ALERT ALERT_BREAKGLASS_LOGIN RESUME` (and the remaining three).
+Post-resume `SHOW ALERTS` confirms `state = started` for all four.
+
+### 8. Behavioral anomaly detection
+
+`audit/anomaly_detection.sql` was executed as a daily report against the trial account's
+`ACCOUNT_USAGE` views (up to 24-h latency for `ACCESS_HISTORY`; 2-h for `LOGIN_HISTORY`).
+
+**Section 1 (data-volume spike)** — with synthetic access history too sparse to compute a 7-day
+baseline, the query returns zero rows as expected. Thresholds are documented inline for tuning
+after 30+ days of production data.
+
+**Section 3 (novel client IP)** — after logging in from a second workstation IP (`10.0.2.88`)
+not present in the 30-day `LOGIN_HISTORY` baseline for a PHI-role user:
+
+```
+user_name          | novel_ip    | first_seen              | signal
+JUSTINE.PADAYAO    | 10.0.2.88   | 2026-06-01 09:14:03 UTC | NOVEL_CLIENT_IP
+```
+
+**Section 5 (cross-facility probe)** — simulated by running 15 queries from
+`FR_CLINICAL_ANALYTICS` (entitled FAC_A only) against the PATIENT table where the row-access
+policy filtered every result to 0 rows. After the `ACCESS_HISTORY` latency window:
+
+```
+user_name       | query_date   | total_queries | zero_row_queries | pct_empty | signal
+JUSTINE.PADAYAO | 2026-06-01   | 15            | 15               | 100.0     | HIGH_EMPTY_RESULT_RATE
+```
+
+**Section 6 (auto-classification hints)** — `EXTRACT_SEMANTIC_CATEGORIES` on `RAW_MASKED.GOV.PATIENT`
+returned `EMAIL` and `NAME` columns inferred as `IDENTIFIER` / `PII` privacy category. Both already
+carry `PII_STRING` tags (confirmed by `tag_references` LEFT JOIN returning no rows in the final
+output), so zero unguarded columns were found — the expected result for a correctly tagged schema.
+
+---
+
 ## Reproducing
 
 `snow` CLI with key-pair auth; run `snowflake_rbac.sql`, seed the synthetic rows, then the evidence

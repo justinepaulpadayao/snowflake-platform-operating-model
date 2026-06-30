@@ -13,19 +13,35 @@ Each phase produces evidence, and nothing destructive happens without a reviewed
 
 ## What's in this repository
 
+### Platform foundation
+
 | Path | What it is |
 |---|---|
 | `rbac/snowflake_rbac.sql` | Two-layer RBAC model: roles, grants, service users, PHI masking/row-access, managed schemas, resource monitors, break-glass, safe migration. |
-| `audit/audit_queries.sql` | `ACCOUNT_USAGE` audit pack: recursive role-closure, entitlement-vs-actual, monthly evidence. |
+| `audit/audit_queries.sql` | `ACCOUNT_USAGE` audit pack: recursive role-closure, entitlement-vs-actual, monthly evidence package, PHI gap-check. |
 | `automation/automation_plan.md` | Monthly access-review automation (inputs, diff, outputs, safety controls, tools). |
-| `automation/access_review.py` | Safety-first reference implementation of the access-review reconciliation. |
+| `automation/access_review.py` | Safety-first reference implementation: reconcile, gated apply, blast-radius cap, key rotation check. |
 | `governance/ai_governance_notes.md` | Governance for using AI tools against a HIPAA-sensitive environment. |
 | `infra/terraform_or_iac_example.tf` | IaC sketch for the governance/automation roles + evidence schema. |
 | `docs/VALIDATION.md` | Evidence the controls were verified on a live Snowflake Enterprise account. |
 
-The role names in `snowflake_rbac.sql` (the `FR_*` functional / `AR_*` access roles) are reused
-verbatim across `audit_queries.sql` and the automation, so the components form **one coherent
-system**.
+### Platform hardening
+
+| Path | What it is |
+|---|---|
+| `security/network_policies.sql` | Network policies (corporate VPN, CI/CD runner, break-glass overrides) + PrivateLink configuration guide. |
+| `security/auth_session_policies.sql` | `AUTHENTICATION POLICY` (MFA enforcement) and `SESSION POLICY` (idle timeouts) for human and service identities. |
+| `security/snowflake_alerts.sql` | Native Snowflake `ALERT` objects: break-glass login, PHI masking-policy detach, PHI tag removal, ACCOUNTADMIN session. |
+| `audit/anomaly_detection.sql` | Behavioral anomaly detection: data-volume spikes, off-hours PHI access, novel client IPs, mass export, cross-facility probing, auto-classification gap discovery. |
+| `governance/cortex_ai_governance.md` | Per-surface governance for Snowflake Cortex: LLM functions, Cortex Analyst, Cortex Search, Document AI, and ML functions — each with a distinct PHI risk profile and control set. |
+| `tests/test_access_review.py` | pytest unit tests for the pure reconcile / build_expected / approval-valid core of `access_review.py`. |
+| `.github/workflows/ci.yml` | CI pipeline: SQLFluff lint (Snowflake dialect), pytest, Terraform fmt + validate. |
+| `dbt/` | dbt project scaffold: profiles example, source definitions for `RAW_MASKED.GOV`, staging + mart models, schema tests, and masking-behavior documentation. |
+| `infra/modules/snowflake-platform/` | Full Terraform module managing the complete `AR_*`/`FR_*` role model, warehouses, schemas, service accounts, and network policies as state-tracked code. |
+
+The role names (`FR_*` / `AR_*`) are reused verbatim across the RBAC model, audit queries,
+automation, Terraform module, and dbt source definitions — the components form **one coherent
+system** where a change in one layer is visible in every other.
 
 ---
 

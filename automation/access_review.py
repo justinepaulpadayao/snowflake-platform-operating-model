@@ -41,6 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 DEFAULT_STALE_DAYS = 90
 DEFAULT_MAX_REVOKES = 50
+KEY_ROTATION_DAYS = 365
 # Never auto-revoked, even if approved — defense in depth (overlaps matrix config).
 # Every privileged system role plus the PHI/policy capability roles.
 HARD_PROTECTED_ROLES = {
@@ -61,6 +62,7 @@ SEVERITY = {
     "OVER_PROVISIONED": "HIGH",
     "UNMANAGED_SVC": "HIGH",
     "STALE": "MEDIUM",
+    "STALE_KEY": "HIGH",
     "UNDER_PROVISIONED": "LOW",
 }
 SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -82,6 +84,7 @@ class Identity:
     entra_object_id: str | None = None
     account_enabled: bool = True
     last_login: dt.date | None = None
+    key_last_set: dt.date | None = None  # for service accounts: RSA key set date
 
 
 @dataclass
@@ -139,6 +142,7 @@ def reconcile(
     svc_logins: set[str],
     sensitivity: dict[str, str],
     stale_days: int = DEFAULT_STALE_DAYS,
+    key_rotation_days: int = KEY_ROTATION_DAYS,
     today: dt.date | None = None,
 ) -> list[Exception_]:
     """Set diff + identity checks -> exceptions. Pure function."""
@@ -190,6 +194,17 @@ def reconcile(
             )
             continue
         if ident is None or ident.is_service:
+            if ident is not None and ident.is_service and ident.key_last_set:
+                age = (today - ident.key_last_set).days
+                if age > key_rotation_days:
+                    out.append(
+                        mk(
+                            "STALE_KEY",
+                            login,
+                            None,
+                            f"RSA key not rotated in {age} days (last set {ident.key_last_set}).",
+                        )
+                    )
             continue
         if ident.entra_object_id is None or not ident.account_enabled:
             out.append(
@@ -388,7 +403,13 @@ def run(
     actual = sf.actual_grants()
     expected, sensitivity = build_expected(role_matrix, group_membership, svc_inventory)
     exceptions = reconcile(
-        actual, expected, identities, svc_logins, sensitivity, args.stale_days
+        actual,
+        expected,
+        identities,
+        svc_logins,
+        sensitivity,
+        args.stale_days,
+        args.key_rotation_days,
     )
 
     run_id = args.run_id
@@ -437,6 +458,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--approvals", help="Path to signed approvals.json. Required with --apply."
     )
     p.add_argument("--max-revokes", type=int, default=DEFAULT_MAX_REVOKES)
+    p.add_argument(
+        "--key-rotation-days",
+        type=int,
+        default=KEY_ROTATION_DAYS,
+        help="Flag service-account RSA keys older than this many days as STALE_KEY.",
+    )
     p.add_argument(
         "--runner", default="ci-bot", help="Identity running the job (for SoD)."
     )
