@@ -1,0 +1,13 @@
+[sqlfluff]
+dialect = snowflake
+templater = raw
+large_file_skip_byte_limit = 0
+# Focus on parse-ability and real issues, not cosmetic layout, for review SQL.
+exclude_rules = LT05, LT02, LT01, LT09, LT12, CP01, CP02, CP03, RF02, RF03, AL01, ST06, AM04
+
+[sqlfluff:indentation]
+indent_unit = space
+tab_space_size = 4
+
+[sqlfluff:rules]
+max_line_length = 120

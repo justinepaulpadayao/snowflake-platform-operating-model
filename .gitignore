@@ -1,0 +1,33 @@
+# Windows / WSL artifacts
+*:Zone.Identifier
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+.idea/
+*.swp
+
+# Local scratch / working artifacts
+scratch/
+*.local.*
+
+# Secrets — never commit (PHI-safe by default)
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# Assistant tooling + local working notes: never tracked
+.claude/
+docs/superpowers/
+docs/standards/
+
+# Source brief / external docs that must never be published
+*Assessment*.md
