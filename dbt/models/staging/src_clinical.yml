@@ -1,0 +1,55 @@
+version: 2
+
+sources:
+  - name: clinical_source
+    description: >
+      Clinical source layer (RAW_MASKED.GOV).  All tables in this schema are
+      protected by tag-based dynamic masking and row-access policies applied in
+      snowflake_rbac.sql.  dbt's service account (SVC_DBT / FR_DBT_TRANSFORM)
+      holds AR_RAW_GOV_R but NOT AR_PHI_UNMASK, so dbt reads MASKED column
+      values — string PHI appears as '***REDACTED***' and dates are generalized
+      to the first of the year.  This is by design: marts downstream of this
+      source inherit masked values, making them safe for all consumers.
+
+    database: RAW_MASKED
+    schema: GOV
+
+    tables:
+      - name: PATIENT
+        description: >
+          Synthetic PHI table demonstrating the masking model.  Each column
+          tagged PII_STRING or PII_DATE is masked for any session that does not
+          hold AR_PHI_UNMASK.  Row access is scoped to the facility_id values
+          in GOV.ROW_ENTITLEMENTS for the active session role — dbt reads all
+          rows because FR_DBT_TRANSFORM is explicitly allowed full-row access
+          in the row-access policy.
+        columns:
+          - name: patient_id
+            description: Non-PHI surrogate key (not a HIPAA identifier).
+            tests:
+              - not_null
+              - unique
+
+          - name: full_name
+            description: >
+              PII_STRING-tagged.  Masked to '***REDACTED***' for any caller
+              without AR_PHI_UNMASK.  dbt sees the masked value.
+
+          - name: mrn
+            description: Medical record number.  PII_STRING-tagged.
+
+          - name: dob
+            description: >
+              Date of birth.  PII_DATE-tagged.  Generalized to YYYY-01-01
+              for callers without AR_PHI_UNMASK.
+
+          - name: email
+            description: Patient email.  PII_STRING-tagged.
+
+          - name: facility_id
+            description: >
+              Facility identifier used by the row-access policy
+              (GOV.RAP_FACILITY) to scope rows to entitled facilities.
+              Not a PHI identifier — left unmasked for joins and aggregation.
+            tests:
+              - not_null

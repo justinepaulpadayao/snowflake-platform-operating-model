@@ -1,0 +1,44 @@
+name: "odc_platform"
+version: "1.0.0"
+config-version: 2
+
+profile: "odc_platform"
+
+model-paths:     ["models"]
+test-paths:      ["tests"]
+macro-paths:     ["macros"]
+snapshot-paths:  ["snapshots"]
+analysis-paths:  ["analyses"]
+target-path:     "target"
+clean-targets:   ["target", "dbt_packages"]
+
+# ============================================================================
+# Model configuration
+# Key design principle: SVC_DBT holds FR_DBT_TRANSFORM, which has AR_RAW_GOV_R
+# but NOT AR_PHI_UNMASK.  dbt therefore operates on masked PHI values — PHI
+# columns written into staging/marts contain ***REDACTED*** or generalized dates.
+# This is intentional: the marts are safe for all consumers by construction,
+# without requiring per-query masking at the mart layer.
+# Clinical analysts who need unmasked PHI query RAW_MASKED.GOV directly.
+# ============================================================================
+models:
+  odc_platform:
+    staging:
+      +materialized: view           # staging is ephemeral views; no storage cost
+      +schema: STAGING
+      +database: ANALYTICS
+
+    marts:
+      +materialized: table
+      +schema: MARTS
+      +database: ANALYTICS
+
+    kpis:
+      +materialized: table
+      +schema: REPORTING
+      +database: KPIS
+
+vars:
+  # Default lookback window for incremental models.  Override at runtime:
+  #   dbt run --vars '{"lookback_days": 7}'
+  lookback_days: 90

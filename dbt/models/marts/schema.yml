@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: patients_by_facility
+    description: >
+      Facility-level patient headcount.  Safe for all analyst roles (AR_MARTS_R).
+      Contains no PHI identifiers — only facility_id and aggregate count.
+    columns:
+      - name: facility_id
+        description: Facility reference key (non-PHI).
+        tests:
+          - not_null
+          - unique
+
+      - name: patient_count
+        description: Distinct patients attributed to the facility.
+        tests:
+          - not_null
+
+      - name: mart_refreshed_at
+        description: Timestamp of the last dbt run that produced this row.
+        tests:
+          - not_null
+
+# ============================================================================
+# Masking policy verification
+# These are out-of-band (run as ACCOUNTADMIN/AUDITOR) and are documented here
+# as the dbt-side evidence checklist to attach to the monthly access review.
+#
+# 1. PHI columns in the source table are protected:
+#      SELECT * FROM snowflake.account_usage.policy_references
+#      WHERE ref_entity_name = 'PATIENT' AND ref_schema_name = 'GOV';
+#    Expected: MP_PHI_STRING on full_name / mrn / email; MP_PHI_DATE on dob;
+#    RAP_FACILITY on the table level.
+#
+# 2. dbt's service account reads masked values (validated in VALIDATION.md):
+#    Connect as SVC_DBT / FR_DBT_TRANSFORM and query stg_patients;
+#    full_name should return '***REDACTED***'.
+#
+# 3. Mart table has no masking policy (values are already aggregated / non-PHI):
+#      SELECT * FROM snowflake.account_usage.policy_references
+#      WHERE ref_entity_name = 'PATIENTS_BY_FACILITY';
+#    Expected: zero rows (no masking needed; no PHI columns in this mart).
+# ============================================================================

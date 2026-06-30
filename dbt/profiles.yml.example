@@ -1,0 +1,39 @@
+# profiles.yml.example
+# Copy this file to ~/.dbt/profiles.yml (or set DBT_PROFILES_DIR).
+# Never commit the live profiles.yml — it contains key-pair paths or vault refs.
+#
+# Authentication: key-pair JWT, matching SVC_DBT's RSA_PUBLIC_KEY in Snowflake.
+# The private key is stored in a secrets manager; reference it via an env var
+# or the Snowflake connector's private_key_path pointing to a vault-mounted path.
+#
+# Role: FR_DBT_TRANSFORM — reads masked PHI from RAW_MASKED.GOV, owns builds
+# in ANALYTICS.STAGING, ANALYTICS.MARTS, and KPIS.REPORTING.
+
+odc_platform:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account:        "{{ env_var('SNOWFLAKE_ACCOUNT') }}"  # org-account format
+      user:           SVC_DBT
+      role:           FR_DBT_TRANSFORM
+      warehouse:      WH_TRANSFORM
+      database:       ANALYTICS
+      schema:         STAGING
+      authenticator:  snowflake_jwt
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      threads:        4
+      query_tag:      "dbt:dev:{{ env_var('DBT_RUN_ID', 'local') }}"
+
+    prod:
+      type: snowflake
+      account:        "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user:           SVC_DBT
+      role:           FR_DBT_TRANSFORM
+      warehouse:      WH_TRANSFORM
+      database:       ANALYTICS
+      schema:         STAGING
+      authenticator:  snowflake_jwt
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      threads:        8
+      query_tag:      "dbt:prod:{{ env_var('DBT_RUN_ID', 'manual') }}"
