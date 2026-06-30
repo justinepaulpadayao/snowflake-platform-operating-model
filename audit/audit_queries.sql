@@ -58,7 +58,7 @@ SELECT DISTINCT
     CASE WHEN c.top_role = c.reachable_role THEN 'DIRECT' ELSE 'INHERITED' END AS access_path
 FROM closure c
 INNER JOIN snowflake.account_usage.grants_to_users gu
-    ON gu.role = c.top_role AND gu.deleted_on IS NULL
+    ON c.top_role = gu.role AND gu.deleted_on IS NULL
 ORDER BY user_name, effective_role;
 
 
@@ -96,9 +96,9 @@ SELECT DISTINCT
     u.last_success_login
 FROM closure c
 INNER JOIN snowflake.account_usage.grants_to_users gu
-    ON gu.role = c.top_role AND gu.deleted_on IS NULL
+    ON c.top_role = gu.role AND gu.deleted_on IS NULL
 LEFT JOIN snowflake.account_usage.users u
-    ON u.name = gu.grantee_name AND u.deleted_on IS NULL
+    ON gu.grantee_name = u.name AND u.deleted_on IS NULL
 ORDER BY privileged_role, user_name;
 
 
@@ -121,7 +121,7 @@ SELECT
     LISTAGG(DISTINCT gu.role, ', ') WITHIN GROUP (ORDER BY gu.role) AS roles_held
 FROM snowflake.account_usage.users u
 LEFT JOIN snowflake.account_usage.grants_to_users gu
-    ON gu.grantee_name = u.name AND gu.deleted_on IS NULL
+    ON u.name = gu.grantee_name AND gu.deleted_on IS NULL
 WHERE u.deleted_on IS NULL
   AND (u.type = 'SERVICE'
        OR (u.has_rsa_public_key = TRUE AND u.has_password = FALSE)
@@ -160,7 +160,7 @@ SELECT
     'GRANT_TO_ROLE' AS change_scope,
     created_on,
     deleted_on,
-    CASE WHEN deleted_on IS NULL THEN 'ADDED' ELSE 'REVOKED' END AS action,
+    CASE WHEN deleted_on IS NULL THEN 'ADDED' ELSE 'REVOKED' END AS grant_action,
     grantee_name AS role_name,
     privilege,
     granted_on   AS object_type,
@@ -177,7 +177,7 @@ SELECT
     'GRANT_TO_USER' AS change_scope,
     created_on,
     deleted_on,
-    CASE WHEN deleted_on IS NULL THEN 'ADDED' ELSE 'REVOKED' END AS action,
+    CASE WHEN deleted_on IS NULL THEN 'ADDED' ELSE 'REVOKED' END AS grant_action,
     grantee_name AS role_name,
     'ROLE'       AS privilege,
     'USER'       AS object_type,
@@ -205,7 +205,7 @@ WITH used_roles AS (
 
 SELECT r.name AS role_name, 'NO QUERIES IN 90 DAYS' AS finding
 FROM snowflake.account_usage.roles r
-LEFT JOIN used_roles ur ON ur.role_name = r.name
+LEFT JOIN used_roles ur ON r.name = ur.role_name
 WHERE r.deleted_on IS NULL
   AND ur.role_name IS NULL
   AND NOT STARTSWITH(r.name, 'AR_')  -- access roles are inherited by design, not session roles
@@ -215,7 +215,7 @@ ORDER BY r.name;
 SELECT
     grantee_name AS role_name,
     COUNT(*)     AS privilege_count,
-    LISTAGG(DISTINCT privilege, ', ') WITHIN GROUP (ORDER BY privilege) AS privileges
+    LISTAGG(DISTINCT privilege, ', ') WITHIN GROUP (ORDER BY privilege) AS privilege_list
 FROM snowflake.account_usage.grants_to_roles
 WHERE deleted_on IS NULL
   AND privilege IN (
@@ -242,17 +242,20 @@ WITH phi_readers AS (
 phi_seed (role_name) AS (
     SELECT * FROM VALUES ('FR_CLINICAL_ANALYTICS'), ('AR_PHI_UNMASK')
 ),
+
 role_edges AS (
     SELECT name AS child_role, grantee_name AS parent_role
     FROM snowflake.account_usage.grants_to_roles
     WHERE granted_on = 'ROLE' AND privilege = 'USAGE' AND deleted_on IS NULL
 ),
+
 phi_closure (top_role) AS (
     SELECT role_name FROM phi_seed
     UNION ALL
     SELECT e.parent_role
     FROM role_edges e INNER JOIN phi_closure c ON e.child_role = c.top_role
 ),
+
 phi_role_members AS (
     SELECT DISTINCT gu.grantee_name AS user_name
     FROM snowflake.account_usage.grants_to_users gu
@@ -262,7 +265,7 @@ phi_role_members AS (
 
 SELECT m.user_name, 'HAS PHI ROLE, NO PHI ACCESS IN 90 DAYS' AS finding
 FROM phi_role_members m
-LEFT JOIN phi_readers r ON r.user_name = m.user_name
+LEFT JOIN phi_readers r ON m.user_name = r.user_name
 WHERE r.user_name IS NULL
 ORDER BY m.user_name;
 
@@ -273,7 +276,7 @@ ORDER BY m.user_name;
    ============================================================================ */
 -- 7a. Stamped attestation header (proves "reviewed on date X by Y").
 SELECT
-    CURRENT_ACCOUNT()   AS account,
+    CURRENT_ACCOUNT()   AS snowflake_account,
     CURRENT_REGION()    AS region,
     CURRENT_TIMESTAMP() AS review_run_at,
     CURRENT_USER()      AS reviewer,
@@ -293,17 +296,20 @@ ORDER BY disabled, user_name;
 WITH phi_seed (role_name) AS (
     SELECT * FROM VALUES ('FR_CLINICAL_ANALYTICS'), ('AR_PHI_UNMASK'), ('FR_PLATFORM_ADMIN')
 ),
+
 role_edges AS (
     SELECT name AS child_role, grantee_name AS parent_role
     FROM snowflake.account_usage.grants_to_roles
     WHERE granted_on = 'ROLE' AND privilege = 'USAGE' AND deleted_on IS NULL
 ),
+
 phi_closure (top_role, phi_role) AS (
     SELECT role_name, role_name FROM phi_seed
     UNION ALL
     SELECT e.parent_role, c.phi_role
     FROM role_edges e INNER JOIN phi_closure c ON e.child_role = c.top_role
 )
+
 SELECT DISTINCT
     gu.grantee_name AS user_name,
     c.phi_role      AS phi_role_reached,
@@ -312,9 +318,9 @@ SELECT DISTINCT
     u.last_success_login
 FROM phi_closure c
 INNER JOIN snowflake.account_usage.grants_to_users gu
-    ON gu.role = c.top_role AND gu.deleted_on IS NULL
+    ON c.top_role = gu.role AND gu.deleted_on IS NULL
 INNER JOIN snowflake.account_usage.users u
-    ON u.name = gu.grantee_name AND u.deleted_on IS NULL
+    ON gu.grantee_name = u.name AND u.deleted_on IS NULL
 ORDER BY phi_role_reached, user_name;
 
 -- 7d. Control-existence evidence: PHI columns actually protected by policies.
@@ -349,10 +355,10 @@ SELECT
     t.tag_name, t.tag_value
 FROM snowflake.account_usage.tag_references t
 LEFT JOIN snowflake.account_usage.policy_references p
-    ON  p.ref_database_name = t.object_database
-    AND p.ref_schema_name   = t.object_schema
-    AND p.ref_entity_name   = t.object_name
-    AND p.ref_column_name   = t.column_name
+    ON  t.object_database = p.ref_database_name
+    AND t.object_schema   = p.ref_schema_name
+    AND t.object_name   = p.ref_entity_name
+    AND t.column_name   = p.ref_column_name
     AND p.policy_kind       = 'MASKING_POLICY'
 WHERE t.tag_name IN ('PII_STRING', 'PII_DATE')   -- the PHI tags from snowflake_rbac.sql
   AND t.column_name IS NOT NULL
