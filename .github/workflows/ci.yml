@@ -36,8 +36,10 @@ jobs:
       - name: Lint security policies and alerts
         # --ignore parsing: ALERT, SESSION POLICY, and NOTIFICATION INTEGRATION
         # are valid Snowflake Enterprise DDL not yet in SQLFluff's grammar.
-        # PRS (parse) errors for those statements are false positives; lint rules
-        # are still enforced on the parsable sections.
+        # PRS errors for those statements are false positives; lint rules are
+        # enforced on parsable sections.  NOTE: the SQL inside $$ ... $$
+        # stored-procedure bodies is also not parsed by SQLFluff — those code
+        # paths are validated only by live Snowflake execution (see VALIDATION.md).
         run: sqlfluff lint --dialect snowflake --ignore parsing security/
 
   # --------------------------------------------------------------------------
@@ -91,3 +93,10 @@ jobs:
 
       - name: Validate HCL syntax
         run: terraform -chdir=infra validate
+
+      - name: Validate Snowflake platform module
+        # Validates the full module including the corrected role-grant resources
+        # and SECURITYADMIN provider alias.  No cloud credentials are used.
+        run: |
+          terraform -chdir=infra/modules/snowflake-platform init -backend=false
+          terraform -chdir=infra/modules/snowflake-platform validate

@@ -33,10 +33,6 @@ models:
       +schema: MARTS
       +database: ANALYTICS
 
-    kpis:
-      +materialized: table
-      +schema: REPORTING
-      +database: KPIS
 
 vars:
   # Default lookback window for incremental models.  Override at runtime:

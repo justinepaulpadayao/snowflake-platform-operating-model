@@ -45,6 +45,12 @@ CREATE NOTIFICATION INTEGRATION IF NOT EXISTS NI_SECURITY_EMAIL
     ALLOWED_RECIPIENTS = ('<security-team@example.com>')
     COMMENT  = 'Outbound security alerts: break-glass, policy drift, anomalies';
 
+-- SYSADMIN must hold USAGE on NI_SECURITY_EMAIL before the ALERT stored
+-- procedures can call SYSTEM$SEND_EMAIL.  Without this grant, every alert
+-- fires its condition successfully but the notification call fails silently
+-- with an access error — the ALERT history shows FAILED state, no email sent.
+GRANT USAGE ON INTEGRATION NI_SECURITY_EMAIL TO ROLE SYSADMIN;
+
 
 /* ============================================================================
    SECTION 2 -- NETWORK POLICY DEFINITIONS

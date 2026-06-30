@@ -10,14 +10,16 @@
 #   - Warehouses + resource monitors
 #   - Databases and managed-access schemas
 #   - Access roles (AR_*) + functional roles (FR_*)
-#   - Object-privilege grants
-#   - Service accounts (SVC_DBT, SVC_POWERBI)
+#   - Role hierarchy composition (role-to-role grants)
+#   - Service accounts (SVC_DBT, SVC_POWERBI) with TYPE=SERVICE
 #   - Network policies (account-level + per-user overrides)
-#   - Authentication and session policies
 #
-# What is NOT managed here (kept in SQL for auditability):
-#   - Masking policies (CREATE MASKING POLICY) — the provider support is
-#     limited; validate policy DDL directly on the account.
+# What is NOT managed here (kept in SQL for auditability or provider gaps):
+#   - Authentication policies (AP_HUMAN_MFA, AP_SERVICE_KEYPAIR) — managed in
+#     security/auth_session_policies.sql.
+#   - Session policies (SP_STANDARD, SP_PRIVILEGED) — same file.
+#   - Masking policies (CREATE MASKING POLICY) — provider support is limited;
+#     validate policy DDL directly on the account.
 #   - Row access policies — same reason.
 #   - ALERT objects — managed in security/snowflake_alerts.sql.
 #   - SCIM security integration — one-time, manual step in Snowflake console.
@@ -44,6 +46,19 @@ provider "snowflake" {
   authenticator     = "SNOWFLAKE_JWT"
   private_key       = var.snowflake_private_key
   role              = "SYSADMIN"
+}
+
+# SECURITYADMIN alias — required for NETWORK POLICY resources.
+# CREATE / ALTER NETWORK POLICY requires SECURITYADMIN or ACCOUNTADMIN;
+# the default SYSADMIN provider cannot create these objects.
+provider "snowflake" {
+  alias             = "securityadmin"
+  organization_name = var.snowflake_org
+  account_name      = var.snowflake_account
+  user              = "SVC_TERRAFORM"
+  authenticator     = "SNOWFLAKE_JWT"
+  private_key       = var.snowflake_private_key
+  role              = "SECURITYADMIN"
 }
 
 #############################################################################
@@ -257,61 +272,93 @@ resource "snowflake_account_role" "fr_breakglass" {
 
 #############################################################################
 # Role composition — functional roles from access roles
+# snowflake_role_grants was removed in provider 0.87; each grant is now an
+# individual snowflake_grant_role_to_account_role resource.
 # AR_PHI_UNMASK and AR_GOV_ADMIN are DELIBERATELY excluded from the SYSADMIN
 # tree so ACCOUNTADMIN never inherits clear-text PHI or policy authorship.
 #############################################################################
 
-resource "snowflake_role_grants" "platform_admin_from_access" {
-  role_name = snowflake_account_role.fr_platform_admin.name
-  roles = [
-    snowflake_account_role.ar_raw_gov_r.name,
-    snowflake_account_role.ar_raw_metadata_r.name,
-    snowflake_account_role.ar_staging_rw.name,
-    snowflake_account_role.ar_marts_rw.name,
-    snowflake_account_role.ar_kpis_rw.name,
-  ]
+resource "snowflake_grant_role_to_account_role" "ar_raw_gov_r_to_platform_admin" {
+  role_name        = snowflake_account_role.ar_raw_gov_r.name
+  parent_role_name = snowflake_account_role.fr_platform_admin.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_raw_metadata_r_to_platform_admin" {
+  role_name        = snowflake_account_role.ar_raw_metadata_r.name
+  parent_role_name = snowflake_account_role.fr_platform_admin.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_staging_rw_to_platform_admin" {
+  role_name        = snowflake_account_role.ar_staging_rw.name
+  parent_role_name = snowflake_account_role.fr_platform_admin.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_marts_rw_to_platform_admin" {
+  role_name        = snowflake_account_role.ar_marts_rw.name
+  parent_role_name = snowflake_account_role.fr_platform_admin.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_kpis_rw_to_platform_admin" {
+  role_name        = snowflake_account_role.ar_kpis_rw.name
+  parent_role_name = snowflake_account_role.fr_platform_admin.name
 }
 
-resource "snowflake_role_grants" "gov_admin_from_access" {
-  role_name = snowflake_account_role.fr_gov_admin.name
-  roles     = [snowflake_account_role.ar_gov_admin.name]
+resource "snowflake_grant_role_to_account_role" "ar_gov_admin_to_gov_admin" {
+  role_name        = snowflake_account_role.ar_gov_admin.name
+  parent_role_name = snowflake_account_role.fr_gov_admin.name
 }
 
-resource "snowflake_role_grants" "dbt_from_access" {
-  role_name = snowflake_account_role.fr_dbt_transform.name
-  roles = [
-    snowflake_account_role.ar_raw_gov_r.name,
-    snowflake_account_role.ar_raw_metadata_r.name,
-    snowflake_account_role.ar_staging_rw.name,
-    snowflake_account_role.ar_marts_rw.name,
-    snowflake_account_role.ar_kpis_rw.name,
-  ]
+resource "snowflake_grant_role_to_account_role" "ar_raw_gov_r_to_dbt" {
+  role_name        = snowflake_account_role.ar_raw_gov_r.name
+  parent_role_name = snowflake_account_role.fr_dbt_transform.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_raw_metadata_r_to_dbt" {
+  role_name        = snowflake_account_role.ar_raw_metadata_r.name
+  parent_role_name = snowflake_account_role.fr_dbt_transform.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_staging_rw_to_dbt" {
+  role_name        = snowflake_account_role.ar_staging_rw.name
+  parent_role_name = snowflake_account_role.fr_dbt_transform.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_marts_rw_to_dbt" {
+  role_name        = snowflake_account_role.ar_marts_rw.name
+  parent_role_name = snowflake_account_role.fr_dbt_transform.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_kpis_rw_to_dbt" {
+  role_name        = snowflake_account_role.ar_kpis_rw.name
+  parent_role_name = snowflake_account_role.fr_dbt_transform.name
 }
 
-resource "snowflake_role_grants" "bi_from_access" {
-  role_name = snowflake_account_role.fr_bi_reporting.name
-  roles = [
-    snowflake_account_role.ar_marts_r.name,
-    snowflake_account_role.ar_kpis_r.name,
-  ]
+resource "snowflake_grant_role_to_account_role" "ar_marts_r_to_bi" {
+  role_name        = snowflake_account_role.ar_marts_r.name
+  parent_role_name = snowflake_account_role.fr_bi_reporting.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_kpis_r_to_bi" {
+  role_name        = snowflake_account_role.ar_kpis_r.name
+  parent_role_name = snowflake_account_role.fr_bi_reporting.name
 }
 
-resource "snowflake_role_grants" "clinical_from_access" {
-  role_name = snowflake_account_role.fr_clinical_analytics.name
-  roles = [
-    snowflake_account_role.ar_marts_r.name,
-    snowflake_account_role.ar_kpis_r.name,
-    snowflake_account_role.ar_raw_gov_r.name,
-    snowflake_account_role.ar_phi_unmask.name,   # clear-text PHI gate
-  ]
+resource "snowflake_grant_role_to_account_role" "ar_marts_r_to_clinical" {
+  role_name        = snowflake_account_role.ar_marts_r.name
+  parent_role_name = snowflake_account_role.fr_clinical_analytics.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_kpis_r_to_clinical" {
+  role_name        = snowflake_account_role.ar_kpis_r.name
+  parent_role_name = snowflake_account_role.fr_clinical_analytics.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_raw_gov_r_to_clinical" {
+  role_name        = snowflake_account_role.ar_raw_gov_r.name
+  parent_role_name = snowflake_account_role.fr_clinical_analytics.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_phi_unmask_to_clinical" {
+  # clear-text PHI gate — deliberately not in the SYSADMIN tree
+  role_name        = snowflake_account_role.ar_phi_unmask.name
+  parent_role_name = snowflake_account_role.fr_clinical_analytics.name
 }
 
-resource "snowflake_role_grants" "analyst_from_access" {
-  role_name = snowflake_account_role.fr_analyst.name
-  roles = [
-    snowflake_account_role.ar_marts_r.name,
-    snowflake_account_role.ar_kpis_r.name,
-  ]
+resource "snowflake_grant_role_to_account_role" "ar_marts_r_to_analyst" {
+  role_name        = snowflake_account_role.ar_marts_r.name
+  parent_role_name = snowflake_account_role.fr_analyst.name
+}
+resource "snowflake_grant_role_to_account_role" "ar_kpis_r_to_analyst" {
+  role_name        = snowflake_account_role.ar_kpis_r.name
+  parent_role_name = snowflake_account_role.fr_analyst.name
 }
 
 #############################################################################
@@ -322,10 +369,11 @@ resource "snowflake_user" "svc_dbt" {
   name          = "SVC_DBT"
   login_name    = "SVC_DBT"
   display_name  = "dbt Transform Service"
+  user_type         = "SERVICE"
   default_role      = snowflake_account_role.fr_dbt_transform.name
   default_warehouse = snowflake_warehouse.transform.name
   rsa_public_key    = var.svc_dbt_rsa_public_key
-  comment           = "dbt transformation service account (key-pair auth)"
+  comment           = "dbt transformation service account (key-pair auth, TYPE=SERVICE)"
 
   lifecycle {
     ignore_changes = [password]
@@ -336,24 +384,25 @@ resource "snowflake_user" "svc_powerbi" {
   name          = "SVC_POWERBI"
   login_name    = "SVC_POWERBI"
   display_name  = "Power BI Reporting Service"
+  user_type         = "SERVICE"
   default_role      = snowflake_account_role.fr_bi_reporting.name
   default_warehouse = snowflake_warehouse.bi.name
   rsa_public_key    = var.svc_powerbi_rsa_public_key
-  comment           = "Power BI service account (key-pair auth)"
+  comment           = "Power BI service account (key-pair auth, TYPE=SERVICE)"
 
   lifecycle {
     ignore_changes = [password]
   }
 }
 
-resource "snowflake_role_grants" "svc_dbt_role" {
+resource "snowflake_grant_role_to_user" "svc_dbt_role" {
   role_name = snowflake_account_role.fr_dbt_transform.name
-  users     = [snowflake_user.svc_dbt.name]
+  user_name = snowflake_user.svc_dbt.name
 }
 
-resource "snowflake_role_grants" "svc_powerbi_role" {
+resource "snowflake_grant_role_to_user" "svc_powerbi_role" {
   role_name = snowflake_account_role.fr_bi_reporting.name
-  users     = [snowflake_user.svc_powerbi.name]
+  user_name = snowflake_user.svc_powerbi.name
 }
 
 #############################################################################
@@ -361,28 +410,46 @@ resource "snowflake_role_grants" "svc_powerbi_role" {
 #############################################################################
 
 resource "snowflake_network_policy" "corporate" {
+  provider        = snowflake.securityadmin
   name            = "NP_CORPORATE"
   allowed_ip_list = var.corporate_vpn_cidrs
   comment         = "Corporate VPN + HQ egress — account-level default"
 }
 
 resource "snowflake_network_policy" "ci_runners" {
+  provider        = snowflake.securityadmin
   name            = "NP_CI_RUNNERS"
   allowed_ip_list = var.ci_runner_cidrs
   comment         = "CI/CD runner IPs — service accounts only"
 }
 
+resource "snowflake_network_policy" "breakglass" {
+  provider        = snowflake.securityadmin
+  name            = "NP_BREAKGLASS"
+  allowed_ip_list = var.breakglass_cidrs
+  comment         = "Break-glass emergency user — includes IR workstation range"
+}
+
 resource "snowflake_network_policy_attachment" "account_default" {
+  provider            = snowflake.securityadmin
   network_policy_name = snowflake_network_policy.corporate.name
   set_for_account     = true
 }
 
 resource "snowflake_network_policy_attachment" "svc_dbt" {
+  provider            = snowflake.securityadmin
   network_policy_name = snowflake_network_policy.ci_runners.name
   users               = [snowflake_user.svc_dbt.name]
 }
 
 resource "snowflake_network_policy_attachment" "svc_powerbi" {
+  provider            = snowflake.securityadmin
   network_policy_name = snowflake_network_policy.ci_runners.name
   users               = [snowflake_user.svc_powerbi.name]
+}
+
+resource "snowflake_network_policy_attachment" "breakglass_user" {
+  provider            = snowflake.securityadmin
+  network_policy_name = snowflake_network_policy.breakglass.name
+  users               = ["BREAKGLASS_01"]
 }

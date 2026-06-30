@@ -134,3 +134,31 @@ redact/synthetic/stop. (2) Tool approved for this data class? → if not, switch
 
 *This document is operational guidance and does not replace the organization's formal HIPAA
 policies, Business Associate Agreements, or the Security/Privacy Officer's authority.*
+
+---
+
+## Appendix: Audit log retention — the 6-year gap
+
+HIPAA §164.312(b) requires audit control evidence to be retained for **six years** from creation or
+last effective date (45 CFR §164.530(j)). Snowflake `ACCOUNT_USAGE` retains most views for **90
+days** (up to 365 days for some); `ACCESS_HISTORY` retains for 365 days. Neither satisfies the
+6-year requirement.
+
+**Gap:** The monthly access-review evidence exported by `access_review.py`
+(`audit_evidence_<run_id>.json` + `.sha256`) lives in the runner's working directory unless
+explicitly shipped elsewhere.
+
+**Required control (to be implemented before production):**
+1. The CI/CD job that runs `access_review.py` uploads each evidence artifact to an **object-storage
+   bucket configured with immutable retention** (AWS S3 Object Lock COMPLIANCE mode, 6-year minimum;
+   Azure Blob Storage with Immutability Policy; GCS Bucket Lock — equivalent). Once written, no
+   IAM role — including ACCOUNTADMIN — should be able to delete or overwrite the object.
+2. The Snowflake `QUERY_HISTORY`, `LOGIN_HISTORY`, and `ACCESS_HISTORY` relevant to each review
+   period must also be exported (via `COPY INTO` or the connector) and stored in the same
+   immutable bucket before the 90/365-day ACCOUNT_USAGE window expires.
+3. The export job, retention tier, and integrity check (SHA-256 match) should themselves be logged
+   and included in the annual HIPAA audit package.
+
+Until this pipeline exists, the monthly JSON exports satisfy the access-review process but **do not
+satisfy the HIPAA evidence-retention requirement**. Track this as a compliance gap in the
+organization's risk register.

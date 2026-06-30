@@ -54,7 +54,7 @@ baseline AS (
     SELECT
         user_name,
         AVG(rows_produced_day)    AS avg_7d,
-        STDDEV(rows_produced_day) AS stddev_7d
+        STDDEV(rows_produced_day) AS stddev_7d  -- used in WHERE: avg + 2*stddev
     FROM daily_volume
     WHERE query_date < CURRENT_DATE()
     GROUP BY user_name
@@ -76,7 +76,7 @@ SELECT
 FROM today_volume t
 INNER JOIN baseline b ON t.user_name = b.user_name
 WHERE b.avg_7d > 0
-  AND t.rows_produced_day > b.avg_7d * 3   -- EDIT: tune threshold
+  AND t.rows_produced_day > b.avg_7d + 2 * COALESCE(b.stddev_7d, 0)  -- EDIT: tune threshold
 ORDER BY multiple_of_baseline DESC;
 
 
@@ -111,7 +111,7 @@ SELECT
     rows_produced,
     'OFF_HOURS_PHI_ACCESS'   AS signal
 FROM phi_sessions
-WHERE hour_local NOT BETWEEN 6 AND 22   -- EDIT: adjust business-hours window
+WHERE hour_local NOT BETWEEN 6 AND 21   -- business hours 06:00–21:59; 22:00+ is off-hours
    OR dow IN (0, 6)                     -- weekend
 ORDER BY query_start_time DESC;
 

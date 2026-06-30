@@ -19,17 +19,21 @@ from pathlib import Path
 # without an installed package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+
+import pytest
+
 from automation.access_review import (
+    HARD_PROTECTED_ROLES,
+    SEVERITY,
     Exception_,
     Grant,
     Identity,
     _approval_valid,
     _exc_id,
     _q,
+    apply_remediation,
     build_expected,
     reconcile,
-    HARD_PROTECTED_ROLES,
-    SEVERITY,
 )
 
 
@@ -435,3 +439,92 @@ class TestIdentifierQuoting:
     def test_role_with_slash(self):
         result = _q("AR_PHI/UNMASK")
         assert result.startswith('"') and result.endswith('"')
+
+
+# =========================================================================== #
+# apply_remediation guard rails
+# =========================================================================== #
+
+
+class _MockSF:
+    """Minimal SnowflakeClient stand-in that records revoke calls."""
+
+    def __init__(self, grant_exists=True):
+        self._grant_exists = grant_exists
+        self.revoked: list[tuple[str, str]] = []
+
+    def live_grant_exists(self, identity: str, role: str) -> bool:
+        return self._grant_exists
+
+    def revoke(self, identity: str, role: str) -> None:
+        self.revoked.append((identity, role))
+
+
+def _over_provisioned(identity: str, role: str, severity: str = "HIGH") -> Exception_:
+    exc = Exception_(
+        exception_id=_exc_id("OVER_PROVISIONED", identity, role),
+        kind="OVER_PROVISIONED",
+        identity=identity,
+        role=role,
+        severity=severity,
+        sensitivity="internal",
+        detail="test",
+    )
+    exc.revoke_sql = f"REVOKE ROLE {_q(role)} FROM USER {_q(identity)};"
+    exc.rollback_sql = f"GRANT ROLE {_q(role)} TO USER {_q(identity)};"
+    return exc
+
+
+def _approval_for(exc: Exception_, runner: str = "ci-bot") -> dict:
+    return {
+        "approver": "manager",
+        "run_id": "2024-06",
+        "identity": exc.identity,
+        "role": exc.role or "",
+        "action": "REVOKE",
+        "expires": "2099-01-01",
+    }
+
+
+class TestApplyRemediationGuardRails:
+    def test_blast_radius_guard_raises(self, tmp_path):
+        """More approved revokes than max_revokes → SystemExit before any revoke."""
+        exceptions = [
+            _over_provisioned("USER_A", "FR_ANALYST"),
+            _over_provisioned("USER_B", "FR_ANALYST"),
+            _over_provisioned("USER_C", "FR_ANALYST"),
+        ]
+        approvals = {e.exception_id: _approval_for(e) for e in exceptions}
+        sf = _MockSF()
+
+        with pytest.raises(SystemExit):
+            apply_remediation(
+                exceptions, approvals, sf, tmp_path, "ci-bot", 2, "2024-06"
+            )
+
+        assert sf.revoked == [], (
+            "no revokes should execute before the blast-radius check"
+        )
+
+    def test_critical_exceptions_excluded_from_candidates(self, tmp_path):
+        """CRITICAL severity exceptions are never auto-revoked even when approved."""
+        exc = _over_provisioned(
+            "PHI_USER", "FR_CLINICAL_ANALYTICS", severity="CRITICAL"
+        )
+        approvals = {exc.exception_id: _approval_for(exc)}
+        sf = _MockSF()
+
+        apply_remediation([exc], approvals, sf, tmp_path, "ci-bot", 10, "2024-06")
+
+        assert sf.revoked == [], "CRITICAL exceptions must require manual intervention"
+
+    def test_hard_protected_roles_excluded_from_candidates(self, tmp_path):
+        """Roles in HARD_PROTECTED_ROLES are never auto-revoked."""
+        for protected_role in ["ACCOUNTADMIN", "SECURITYADMIN", "AR_PHI_UNMASK"]:
+            exc = _over_provisioned("ADMIN_USER", protected_role)
+            approvals = {exc.exception_id: _approval_for(exc)}
+            sf = _MockSF()
+
+            apply_remediation([exc], approvals, sf, tmp_path, "ci-bot", 10, "2024-06")
+
+            assert sf.revoked == [], f"{protected_role} must not be auto-revoked"

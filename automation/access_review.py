@@ -265,6 +265,33 @@ class SnowflakeClient:
     def revoke(self, identity: str, role: str) -> None:
         self._query(f"REVOKE ROLE {_q(role)} FROM USER {_q(identity)}")
 
+    def service_accounts(self) -> dict[str, "Identity"]:
+        """Return Identity objects for TYPE=SERVICE users, populated with
+        key_last_set from USERS.RSA_PUBLIC_KEY_LAST_SET_ON.
+
+        NULL RSA_PUBLIC_KEY_LAST_SET_ON means the key was set before
+        ACCOUNT_USAGE began tracking the field (or no key has ever been set).
+        Both cases are materially different risk profiles:
+          - Never set: no key-pair auth possible, service account is broken.
+          - Set before tracking: age is unknown; treat conservatively as stale
+            (set key_last_set to the ACCOUNT_USAGE epoch for your account).
+        Callers should populate identities[login].key_last_set before calling
+        reconcile() so STALE_KEY detection is live rather than silent."""
+        rows = self._query(
+            "SELECT name AS login, rsa_public_key_last_set_on "
+            "FROM snowflake.account_usage.users "
+            "WHERE type = 'SERVICE' AND deleted_on IS NULL AND disabled = FALSE"
+        )
+        result = {}
+        for r in rows:
+            login = r["LOGIN"].upper()
+            raw_date = r["RSA_PUBLIC_KEY_LAST_SET_ON"]
+            key_date = raw_date.date() if hasattr(raw_date, "date") else None
+            result[login] = Identity(
+                login=login, is_service=True, key_last_set=key_date
+            )
+        return result
+
 
 # --------------------------------------------------------------------------- #
 # Outputs + gated remediation

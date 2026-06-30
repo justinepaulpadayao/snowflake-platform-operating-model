@@ -220,9 +220,9 @@ CREATE OR REPLACE ALERT ALERT_PHI_TAG_UNSET
         CALL GOVERNANCE.ACCESS_REVIEW.SP_ALERT_PHI_CONTROL_TAMPER('TAG_REMOVAL');
 
 -- 2d. ACCOUNTADMIN session query alert — poll every 15 minutes.
---     ACCOUNTADMIN should never be the active role for routine operations.
---     Any query under this role is noteworthy; any non-break-glass query is
---     an exception that warrants a brief investigation.
+--     Fires only on DML/DDL/SELECT — SHOW, DESCRIBE, and USE commands run
+--     under ACCOUNTADMIN every time the monitoring queries in Section 4 run,
+--     and would cause alert fatigue that trains responders to ignore the alert.
 CREATE OR REPLACE ALERT ALERT_ACCOUNTADMIN_QUERY
     WAREHOUSE = WH_ACCESS_REVIEW
     SCHEDULE  = '15 MINUTE'
@@ -232,6 +232,7 @@ CREATE OR REPLACE ALERT ALERT_ACCOUNTADMIN_QUERY
         WHERE role_name       = 'ACCOUNTADMIN'
           AND execution_status = 'SUCCESS'
           AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+          AND query_type NOT IN ('SHOW', 'DESCRIBE', 'USE')
     ))
     THEN
         CALL GOVERNANCE.ACCESS_REVIEW.SP_ALERT_ACCOUNTADMIN_QUERY();

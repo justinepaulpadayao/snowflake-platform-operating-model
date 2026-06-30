@@ -34,6 +34,11 @@ variable "ci_runner_cidrs" {
   description = "CI/CD runner IP ranges applied to service account network policies."
 }
 
+variable "breakglass_cidrs" {
+  type        = list(string)
+  description = "Allowed CIDRs for the break-glass emergency user (includes IR workstation range)."
+}
+
 variable "security_alert_email" {
   type        = string
   description = "Email address for security alert notifications."
