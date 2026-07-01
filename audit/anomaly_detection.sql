@@ -50,10 +50,11 @@ WITH daily_volume AS (
         SUM(qh.rows_produced)  AS rows_produced_day
     FROM snowflake.account_usage.query_history qh
     INNER JOIN snowflake.account_usage.access_history ah
-        ON ah.query_id = qh.query_id
-       AND ah.query_start_time = qh.start_time
+        ON qh.query_id = ah.query_id
+       AND qh.start_time = ah.query_start_time
     WHERE qh.start_time >= DATEADD('day', -8, CURRENT_TIMESTAMP())
-      AND qh.user_name NOT ILIKE ANY ('SVC_%', '%_SVC', 'BREAKGLASS_%')
+      -- Snowflake rejects `x NOT ILIKE ANY (...)`; negate the whole predicate.
+      AND NOT (qh.user_name ILIKE ANY ('SVC_%', '%_SVC', 'BREAKGLASS_%'))
     GROUP BY qh.user_name, DATE(qh.start_time)
 ),
 
@@ -98,14 +99,17 @@ WITH phi_sessions AS (
     SELECT
         ah.user_name,
         ah.query_start_time,
-        EXTRACT('hour' FROM CONVERT_TIMEZONE('<YOUR_TIMEZONE>', ah.query_start_time)) AS hour_local,
+        HOUR(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', ah.query_start_time)) AS hour_local,
         DAYOFWEEK(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', ah.query_start_time))           AS dow,
-        SUM(ah.rows_produced) AS rows_produced
-    FROM snowflake.account_usage.access_history ah,
-         LATERAL FLATTEN(input => ah.base_objects_accessed) f
+        SUM(qh.rows_produced) AS rows_produced   -- rows_produced lives in QUERY_HISTORY
+    FROM snowflake.account_usage.access_history ah
+    INNER JOIN snowflake.account_usage.query_history qh
+        ON ah.query_id = qh.query_id
+       AND ah.query_start_time = qh.start_time,
+    LATERAL FLATTEN(input => ah.base_objects_accessed) f
     WHERE ah.query_start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
       AND f.value:objectName::string ILIKE 'RAW_MASKED.GOV.%'
-      AND ah.user_name NOT ILIKE ANY ('SVC_%', 'BREAKGLASS_%')
+      AND NOT (ah.user_name ILIKE ANY ('SVC_%', 'BREAKGLASS_%'))
     GROUP BY ah.user_name, ah.query_start_time, hour_local, dow
 )
 
@@ -185,7 +189,7 @@ LATERAL FLATTEN(input => ah.base_objects_accessed) f
 WHERE ah.query_start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
   AND f.value:objectName::string ILIKE 'RAW_MASKED.GOV.%'
   AND qh.rows_produced > 10000         -- EDIT: tune to data volume
-  AND ah.user_name NOT ILIKE ANY ('SVC_%', 'BREAKGLASS_%')
+  AND NOT (ah.user_name ILIKE ANY ('SVC_%', 'BREAKGLASS_%'))
 ORDER BY qh.rows_produced DESC;
 
 
