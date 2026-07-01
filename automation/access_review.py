@@ -247,16 +247,53 @@ class SnowflakeClient:
             cur.close()
 
     def actual_grants(self) -> set[Grant]:
-        """DIRECT role grants to users. NOTE: humans receive FR_* roles via SCIM
-        Entra group-roles (role-to-role), so production must EXPAND each user's
-        effective roles through a recursive GRANTS_TO_ROLES closure (see
-        audit_queries.sql §1) before comparison — otherwise SCIM-inherited access
-        is misclassified. This reference returns direct grants only."""
-        rows = self._query(
+        """Effective role grants per user, including SCIM-inherited roles.
+
+        With Entra/SCIM, Entra groups are synced as Snowflake roles.  A user
+        gets FR_CLINICAL_ANALYTICS because Entra puts them in the group that
+        maps to that role — the grant chain is USER → ENTRA_GROUP_ROLE →
+        FR_CLINICAL_ANALYTICS, not a direct user grant.  A flat GRANTS_TO_USERS
+        query misses every inherited role and misclassifies those users as
+        UNDER_PROVISIONED.
+
+        This method builds the full transitive closure: for each direct
+        user→role grant, walks the role→role USAGE edges in GRANTS_TO_ROLES
+        and adds every reachable role as an effective grant.
+        """
+        direct_rows = self._query(
             "SELECT GRANTEE_NAME AS identity, ROLE AS role "
             "FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_USERS WHERE DELETED_ON IS NULL"
         )
-        return {Grant(r["IDENTITY"].upper(), r["ROLE"].upper()) for r in rows}
+
+        # Build role-to-parent adjacency from GRANTS_TO_ROLES USAGE edges.
+        # GRANTED_ON='ROLE' + PRIVILEGE='USAGE' identifies role-to-role grants.
+        edge_rows = self._query(
+            "SELECT GRANTEE_NAME AS child_role, NAME AS parent_role "
+            "FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_ROLES "
+            "WHERE GRANTED_ON = 'ROLE' AND PRIVILEGE = 'USAGE' "
+            "AND DELETED_ON IS NULL"
+        )
+        role_parents: dict[str, set[str]] = {}
+        for r in edge_rows:
+            child = r["CHILD_ROLE"].upper()
+            parent = r["PARENT_ROLE"].upper()
+            role_parents.setdefault(child, set()).add(parent)
+
+        def reachable(role: str, visited: set[str]) -> set[str]:
+            if role in visited:
+                return set()
+            visited.add(role)
+            result = {role}
+            for parent in role_parents.get(role, set()):
+                result |= reachable(parent, visited)
+            return result
+
+        grants: set[Grant] = set()
+        for r in direct_rows:
+            identity = r["IDENTITY"].upper()
+            for effective_role in reachable(r["ROLE"].upper(), set()):
+                grants.add(Grant(identity, effective_role))
+        return grants
 
     def live_grant_exists(self, identity: str, role: str) -> bool:
         rows = self._query(f"SHOW GRANTS TO USER {_q(identity)}")

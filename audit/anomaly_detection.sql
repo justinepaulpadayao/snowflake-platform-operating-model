@@ -39,15 +39,22 @@
    Exclude automated service accounts (they have predictable, large volumes);
    focus on human FR_* role sessions.
    ============================================================================ */
+-- ACCESS_HISTORY tracks which objects were accessed (and by whom), but does
+-- not carry rows_produced.  That metric lives in QUERY_HISTORY.  We join on
+-- query_id so we can filter to PHI-role sessions in ACCESS_HISTORY while
+-- summing the row count from QUERY_HISTORY.
 WITH daily_volume AS (
     SELECT
-        user_name,
-        DATE(query_start_time) AS query_date,
-        SUM(rows_produced)     AS rows_produced_day
-    FROM snowflake.account_usage.access_history
-    WHERE query_start_time >= DATEADD('day', -8, CURRENT_TIMESTAMP())
-      AND user_name NOT ILIKE ANY ('SVC_%', '%_SVC', 'BREAKGLASS_%')
-    GROUP BY user_name, DATE(query_start_time)
+        qh.user_name,
+        DATE(qh.start_time)    AS query_date,
+        SUM(qh.rows_produced)  AS rows_produced_day
+    FROM snowflake.account_usage.query_history qh
+    INNER JOIN snowflake.account_usage.access_history ah
+        ON ah.query_id = qh.query_id
+       AND ah.query_start_time = qh.start_time
+    WHERE qh.start_time >= DATEADD('day', -8, CURRENT_TIMESTAMP())
+      AND qh.user_name NOT ILIKE ANY ('SVC_%', '%_SVC', 'BREAKGLASS_%')
+    GROUP BY qh.user_name, DATE(qh.start_time)
 ),
 
 baseline AS (
@@ -166,7 +173,7 @@ ORDER BY r.first_seen_recent DESC;
 SELECT
     ah.user_name,
     ah.query_start_time,
-    ah.rows_produced,
+    qh.rows_produced,              -- rows_produced lives in QUERY_HISTORY, not ACCESS_HISTORY
     LEFT(qh.query_text, 300)   AS query_text_excerpt,
     qh.query_id,
     'MASS_EXPORT'              AS signal
@@ -177,9 +184,9 @@ INNER JOIN snowflake.account_usage.query_history qh
 LATERAL FLATTEN(input => ah.base_objects_accessed) f
 WHERE ah.query_start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
   AND f.value:objectName::string ILIKE 'RAW_MASKED.GOV.%'
-  AND ah.rows_produced > 10000         -- EDIT: tune to data volume
+  AND qh.rows_produced > 10000         -- EDIT: tune to data volume
   AND ah.user_name NOT ILIKE ANY ('SVC_%', 'BREAKGLASS_%')
-ORDER BY ah.rows_produced DESC;
+ORDER BY qh.rows_produced DESC;
 
 
 /* ============================================================================
@@ -195,7 +202,7 @@ WITH phi_queries AS (
         qh.user_name,
         DATE(qh.start_time)   AS query_date,
         COUNT(*)              AS total_queries,
-        SUM(CASE WHEN ah.rows_produced = 0 THEN 1 ELSE 0 END) AS zero_row_queries
+        SUM(CASE WHEN qh.rows_produced = 0 THEN 1 ELSE 0 END) AS zero_row_queries
     FROM snowflake.account_usage.query_history qh
     INNER JOIN snowflake.account_usage.access_history ah
         ON qh.query_id = ah.query_id
