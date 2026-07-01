@@ -15,9 +15,21 @@ differ in how they treat **secondary roles**:
 | `IS_ROLE_IN_SESSION('AR_PHI_UNMASK')` | primary role inheritance **and** all activated secondary roles | **counted** |
 | `IS_GRANTED_TO_INVOKER_ROLE('AR_PHI_UNMASK')` | invoker's **primary** role and its inheritance only | **ignored** |
 
-Identity is Entra ID → Snowflake via SCIM. Snowsight activates non-primary roles with
-`USE SECONDARY ROLES ALL` by default. So a user who holds `AR_PHI_UNMASK` only through a
-**secondary** role would see cleartext PHI under `IS_ROLE_IN_SESSION`.
+Identity is Entra ID → Snowflake via SCIM. Two documented defaults make the secondary-role
+path the *common* case, not an edge case:
+
+- **`DEFAULT_SECONDARY_ROLES` defaults to `('ALL')`** since Snowflake behavior-change bundle
+  `2024_08` (`bcr-1692`); before that it was `NULL`. So every role granted to a user
+  auto-activates as a secondary role at login (Snowflake docs, `CREATE USER`).
+- **Entra SCIM provisions all roles as `primary = false`**, and `DEFAULT_ROLE` is a *custom
+  extension attribute* not in the default mapping (Microsoft Learn, Snowflake provisioning
+  tutorial). So SCIM alone does not make any role a user's primary.
+
+Together: a user who holds `AR_PHI_UNMASK` only through a **secondary** role (the default for
+a multi-group SCIM user) would see cleartext PHI under `IS_ROLE_IN_SESSION`. Snowflake's own
+docs frame the distinction: use `IS_ROLE_IN_SESSION` "to evaluate the role hierarchy for the
+current session" (includes secondaries); `IS_GRANTED_TO_INVOKER_ROLE` evaluates the invoker
+(primary) role only.
 
 ## Decision
 
@@ -79,3 +91,21 @@ is a looser posture and was rejected here in favor of fail-closed PHI protection
 Revert the two `ALTER MASKING POLICY ... SET BODY` statements to the
 `IS_ROLE_IN_SESSION('AR_PHI_UNMASK')` body. No object needs detaching; the change is
 in-place and immediate.
+
+## Sources
+
+Documentation (grounded this review):
+- `IS_GRANTED_TO_INVOKER_ROLE` and the IS_ROLE_IN_SESSION distinction —
+  https://docs.snowflake.com/en/sql-reference/functions/is_granted_to_invoker_role
+- `IS_ROLE_IN_SESSION` — https://docs.snowflake.com/en/sql-reference/functions/is_role_in_session
+- `DEFAULT_SECONDARY_ROLES` default is `('ALL')` —
+  https://docs.snowflake.com/en/sql-reference/sql/create-user and behavior-change bundle
+  https://docs.snowflake.com/en/release-notes/bcr-bundles/2024_08/bcr-1692
+- Entra SCIM provisions roles as `primary = false`; `DEFAULT_ROLE` is a custom extension
+  attribute — https://learn.microsoft.com/entra/identity/saas-apps/snowflake-provisioning-tutorial
+
+Live-verified on a Snowflake Enterprise trial this session (not from docs): the in-policy
+masking behavior under tag-based attachment (primary unmask / secondary mask / view
+propagation / ACCOUNTADMIN mask), the literal-only argument to IS_GRANTED_TO_INVOKER_ROLE,
+the context-sensitivity vs a bare SELECT, and that an attached policy cannot be
+CREATE OR REPLACE'd but ALTER ... SET BODY migrates it in place.

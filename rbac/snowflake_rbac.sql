@@ -130,12 +130,15 @@ CREATE TAG IF NOT EXISTS RAW_MASKED.GOV.PII_DATE
 -- PREDICATE CHOICE: IS_GRANTED_TO_INVOKER_ROLE (not IS_ROLE_IN_SESSION).
 --   IS_GRANTED_TO_INVOKER_ROLE evaluates ONLY the invoker's PRIMARY role and its
 --   inheritance -- it excludes activated SECONDARY roles. IS_ROLE_IN_SESSION also
---   counts secondary roles, so under `USE SECONDARY ROLES ALL` (the Snowsight
---   default) a user who holds AR_PHI_UNMASK merely as a secondary role would see
---   cleartext PHI. For a PHI gate we want the fail-closed, primary-role-only
---   semantics. Verified live: with the unmask role active only as a SECONDARY
---   role the column stays REDACTED; it unmasks when reached through the PRIMARY
---   role's inheritance. See governance/adr_phi_masking_predicate.md.
+--   counts secondary roles (Snowflake docs: use IS_ROLE_IN_SESSION "to evaluate
+--   the role hierarchy for the current session"). Since DEFAULT_SECONDARY_ROLES
+--   defaults to ('ALL') -- the account default since behavior-change bundle
+--   2024_08 -- every role granted to a user auto-activates as a secondary role at
+--   login, so under IS_ROLE_IN_SESSION a user who holds AR_PHI_UNMASK merely as a
+--   secondary role would see cleartext PHI. For a PHI gate we want the fail-closed,
+--   primary-role-only semantics. Verified live: with the unmask role active only
+--   as a SECONDARY role the column stays REDACTED; it unmasks when reached through
+--   the PRIMARY role's inheritance. See governance/adr_phi_masking_predicate.md.
 -- OPERATIONAL DEPENDENCY: PHI-cleared users MUST have DEFAULT_ROLE set to the
 --   role that carries AR_PHI_UNMASK (FR_CLINICAL_ANALYTICS) so the unmask role is
 --   their PRIMARY role at query time. SCIM does not set DEFAULT_ROLE; it is set
@@ -471,16 +474,20 @@ GRANT ROLE FR_BREAKGLASS TO USER BREAKGLASS_01;
 -- Break-glass is assigned to a named user out-of-band, never mapped to a group.
 
 -- REQUIRED for PHI unmasking: the masking policies use IS_GRANTED_TO_INVOKER_ROLE,
--- which only honors the invoker's PRIMARY role. A clinical analyst who also sits
--- in another group (e.g. general analyst / BI) may have FR_CLINICAL_ANALYTICS
--- activated only as a SECONDARY role, in which case PHI is masked FROM THEM. SCIM
--- provisions role grants but does NOT set DEFAULT_ROLE, so it must be set
--- out-of-band for every PHI-cleared user so the clinical role is their PRIMARY:
+-- which only honors the invoker's PRIMARY role. Entra SCIM provisions role grants
+-- as PRIMARY = false (Microsoft Learn: Snowflake provisioning tutorial), and
+-- DEFAULT_ROLE is a CUSTOM extension attribute that is NOT in the default mapping
+-- -- so unless it is explicitly configured, a clinical analyst who also sits in
+-- another group (general analyst / BI) can have FR_CLINICAL_ANALYTICS active only
+-- as a SECONDARY role, in which case PHI is masked FROM THEM. Set the default role
+-- out-of-band for every PHI-cleared user (or configure the SCIM DEFAULT_ROLE
+-- custom extension attribute) so the clinical role is their PRIMARY:
 -- ALTER USER "<clinician_login>" SET DEFAULT_ROLE = FR_CLINICAL_ANALYTICS;
--- Snowsight/interactive fallback: run `USE ROLE FR_CLINICAL_ANALYTICS;` before
--- querying PHI. NOTE: DEFAULT_SECONDARY_ROLES = ('ALL') does NOT help here --
--- auto-activated secondary roles are exactly what the invoker predicate ignores.
--- Driver/Power BI/dbt connections set the role explicitly, so they are unaffected.
+-- Interactive fallback: run `USE ROLE FR_CLINICAL_ANALYTICS;` before querying PHI.
+-- NOTE: DEFAULT_SECONDARY_ROLES = ('ALL') (the account default since bundle
+-- 2024_08) does NOT help -- auto-activated secondary roles are exactly what the
+-- invoker predicate ignores. Driver/Power BI/dbt connections set the role
+-- explicitly, so they are unaffected.
 
 
 /* ============================================================================
