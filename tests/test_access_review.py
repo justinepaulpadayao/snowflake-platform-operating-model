@@ -165,6 +165,36 @@ class TestReconcileOverProvisioned:
         assert over[0].revoke_sql is not None
         assert over[0].rollback_sql is not None
 
+    def test_inherited_roles_not_flagged_with_managed_vocab(self):
+        # actual_grants() returns the inheritance closure: a SCIM user holding
+        # FR_CLINICAL_ANALYTICS also shows its AR_* children and the group-role.
+        # With managed_roles set to the assignable vocabulary, those inherited
+        # roles must NOT be flagged OVER_PROVISIONED.
+        actual = {
+            Grant("CHARLIE", "AAD-SF-CLINICAL"),  # SCIM group-role (direct)
+            Grant("CHARLIE", "FR_CLINICAL_ANALYTICS"),  # inherited
+            Grant("CHARLIE", "AR_PHI_UNMASK"),  # inherited AR child
+            Grant("CHARLIE", "AR_MARTS_R"),  # inherited AR child
+        }
+        expected = {Grant("CHARLIE", "FR_CLINICAL_ANALYTICS")}
+        managed = {"FR_CLINICAL_ANALYTICS", "FR_ANALYST"}
+        identities = {"CHARLIE": _identity("CHARLIE")}
+        excs = reconcile(actual, expected, identities, set(), {}, managed_roles=managed)
+        over = [e for e in excs if e.kind == "OVER_PROVISIONED"]
+        under = [e for e in excs if e.kind == "UNDER_PROVISIONED"]
+        assert over == [], "inherited AR_/group roles must not be over-provisioned"
+        assert under == [], "inherited FR_ role satisfies expected; no under-provision"
+
+    def test_over_provisioned_fr_role_still_flagged_with_managed_vocab(self):
+        # A genuinely extra FR_ role (in the vocabulary) is still caught.
+        actual = {Grant("ALICE", "FR_ANALYST"), Grant("ALICE", "FR_CLINICAL_ANALYTICS")}
+        expected = {Grant("ALICE", "FR_ANALYST")}
+        managed = {"FR_ANALYST", "FR_CLINICAL_ANALYTICS"}
+        identities = {"ALICE": _identity("ALICE")}
+        excs = reconcile(actual, expected, identities, set(), {}, managed_roles=managed)
+        over = [e for e in excs if e.kind == "OVER_PROVISIONED"]
+        assert len(over) == 1 and over[0].role == "FR_CLINICAL_ANALYTICS"
+
     def test_phi_sensitivity_escalates_to_critical(self):
         actual = {Grant("ALICE", "FR_CLINICAL_ANALYTICS")}
         expected = set()

@@ -40,70 +40,136 @@
    Each alert THEN clause calls a stored procedure that emits a rich email.
    A stored procedure allows multi-statement logic (gather context, format body)
    that cannot be expressed as a single SQL statement in the THEN clause.
+
+   LATE-DATA CORRECTNESS (important):
+   ACCOUNT_USAGE views are populated with LATENCY (LOGIN_HISTORY up to ~2 h,
+   QUERY_HISTORY up to ~45 min), but SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+   advances in REAL time.  A break-glass login at 09:58 that only becomes
+   queryable at 11:58 has an event_timestamp (09:58) BELOW the watermark
+   (~11:53) — so a naive `event_timestamp > LAST_SUCCESSFUL_SCHEDULED_TIME()`
+   filter silently NEVER matches it, and the event goes undetected.
+
+   Fix (two parts):
+     1. The ALERT IF condition and these procedures look back a fixed window
+        WIDER than the maximum view latency (LATENCY_LOOKBACK below), not just
+        since the last run, so late-arriving rows are still seen.
+     2. A widened window re-sees already-notified events every run, so each
+        procedure DEDUPES against ALERT_STATE by a stable event key and emails
+        only genuinely new events.  This converts "poll since watermark" (loses
+        late data) into "poll a latency-safe window, dedupe" (no loss, no flood).
    ============================================================================ */
 USE ROLE SYSADMIN;
 USE DATABASE GOVERNANCE;
 USE SCHEMA ACCESS_REVIEW;
 
+-- Dedup ledger: one row per already-notified event, keyed by a stable hash.
+CREATE TABLE IF NOT EXISTS GOVERNANCE.ACCESS_REVIEW.ALERT_STATE (
+    alert_name   STRING,
+    event_key    STRING,      -- stable identity of the event (e.g. query_id, or user||ts)
+    notified_at  TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_alert_state PRIMARY KEY (alert_name, event_key)
+);
+
+-- Latency-safe lookback: each alert/procedure looks back a fixed 3 h (literal
+-- in every query below), which exceeds the worst-case ACCOUNT_USAGE latency of
+-- the view it reads (2 h for LOGIN_HISTORY).  Dedup against ALERT_STATE keeps
+-- the wider window from re-notifying the same event.
+
 -- 1a. Break-glass login notifier.
+--     Reads a latency-safe 3 h window, dedupes NEW logins against ALERT_STATE
+--     (key = user||event_timestamp), records them, and emails only new events.
 CREATE OR REPLACE PROCEDURE SP_ALERT_BREAKGLASS()
 RETURNS STRING
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    body STRING;
+    body     STRING;
+    new_ct   NUMBER;
 BEGIN
-    SELECT LISTAGG(
-        'User: '    || user_name
-        || ' | IP: '  || client_ip
-        || ' | Time: ' || event_timestamp::STRING,
-        '\n'
-    )
-    INTO body
-    FROM snowflake.account_usage.login_history
-    WHERE role_name = 'FR_BREAKGLASS'
-      AND is_success = 'YES'
-      AND event_timestamp > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME();
+    -- LOGIN_HISTORY records the USER and login outcome, not the role activated
+    -- (there is no role_name column).  Break-glass is a dedicated, normally
+    -- DISABLED user, so a successful login BY that user is the signal.  Match
+    -- the break-glass login name(s); adjust the pattern to your account.
+    -- New = not already in ALERT_STATE for this alert (dedup over the wide window).
+    CREATE OR REPLACE TEMPORARY TABLE _bg_new AS
+        SELECT
+            MD5(lh.user_name || '|' || lh.event_timestamp::STRING) AS event_key,
+            lh.user_name,
+            lh.client_ip,
+            lh.event_timestamp
+        FROM snowflake.account_usage.login_history lh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_BREAKGLASS_LOGIN'
+         AND s.event_key  = MD5(lh.user_name || '|' || lh.event_timestamp::STRING)
+        WHERE lh.user_name ILIKE 'BREAKGLASS%'
+          AND lh.is_success = 'YES'
+          AND lh.event_timestamp > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND s.event_key IS NULL;
+
+    SELECT COUNT(*) INTO new_ct FROM _bg_new;
+    IF (new_ct = 0) THEN
+        RETURN 'no new events';
+    END IF;
+
+    INSERT INTO GOVERNANCE.ACCESS_REVIEW.ALERT_STATE (alert_name, event_key)
+        SELECT 'ALERT_BREAKGLASS_LOGIN', event_key FROM _bg_new;
+
+    SELECT LISTAGG('User: ' || user_name || ' | IP: ' || client_ip
+                   || ' | Time: ' || event_timestamp::STRING, '\n')
+    INTO body FROM _bg_new;
 
     CALL SYSTEM$SEND_EMAIL(
         'NI_SECURITY_EMAIL',
         '<security-team@example.com>',
         '[CRITICAL] Snowflake Break-Glass Login Detected',
         'Break-glass account activation detected.  Verify this is an approved'
-        || ' incident.\n\n' || COALESCE(body, '(no rows — possible false trigger)')
+        || ' incident.\n\n' || body
     );
-    RETURN 'notified';
+    RETURN 'notified: ' || new_ct::STRING || ' new event(s)';
 END;
 $$;
 
 -- 1b. PHI policy detach / tag removal notifier.
+--     Same latency-safe + dedup pattern; event_key = query_id (unique per stmt).
 CREATE OR REPLACE PROCEDURE SP_ALERT_PHI_CONTROL_TAMPER(event_type STRING)
 RETURNS STRING
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    body  STRING;
-    subj  STRING;
+    body    STRING;
+    subj    STRING;
+    new_ct  NUMBER;
+    aname   STRING := 'ALERT_PHI_CONTROL_TAMPER_' || event_type;
 BEGIN
-    SELECT LISTAGG(
-        'Actor: '    || user_name
-        || ' | SQL: '  || LEFT(query_text, 200)
-        || ' | Time: ' || start_time::STRING,
-        '\n'
-    )
-    INTO body
-    FROM snowflake.account_usage.query_history
-    WHERE execution_status = 'SUCCESS'
-      AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
-      AND (
-          (event_type = 'POLICY_DETACH'
-           AND query_text ILIKE ANY ('%UNSET MASKING POLICY%', '%UNSET ROW ACCESS POLICY%'))
-          OR
-          (event_type = 'TAG_REMOVAL'
-           AND query_text ILIKE ANY ('%UNSET TAG%PII_STRING%', '%UNSET TAG%PII_DATE%'))
-      );
+    CREATE OR REPLACE TEMPORARY TABLE _pt_new AS
+        SELECT qh.query_id AS event_key, qh.user_name, qh.query_text, qh.start_time
+        FROM snowflake.account_usage.query_history qh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = :aname AND s.event_key = qh.query_id
+        WHERE qh.execution_status = 'SUCCESS'
+          AND qh.start_time > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND s.event_key IS NULL
+          AND (
+              (event_type = 'POLICY_DETACH'
+               AND qh.query_text ILIKE ANY ('%UNSET MASKING POLICY%', '%UNSET ROW ACCESS POLICY%'))
+              OR
+              (event_type = 'TAG_REMOVAL'
+               AND qh.query_text ILIKE ANY ('%UNSET TAG%PII_STRING%', '%UNSET TAG%PII_DATE%'))
+          );
+
+    SELECT COUNT(*) INTO new_ct FROM _pt_new;
+    IF (new_ct = 0) THEN
+        RETURN 'no new events';
+    END IF;
+
+    INSERT INTO GOVERNANCE.ACCESS_REVIEW.ALERT_STATE (alert_name, event_key)
+        SELECT :aname, event_key FROM _pt_new;
+
+    SELECT LISTAGG('Actor: ' || user_name || ' | SQL: ' || LEFT(query_text, 200)
+                   || ' | Time: ' || start_time::STRING, '\n')
+    INTO body FROM _pt_new;
 
     subj := CASE event_type
         WHEN 'POLICY_DETACH' THEN '[CRITICAL] PHI Masking or Row-Access Policy Removed'
@@ -115,43 +181,54 @@ BEGIN
         '<security-team@example.com>',
         subj,
         'A PHI data control was altered.  Verify the change is authorized'
-        || ' and that the affected column is still protected.\n\n'
-        || COALESCE(body, '(no rows — possible false trigger)')
+        || ' and that the affected column is still protected.\n\n' || body
     );
-    RETURN 'notified';
+    RETURN 'notified: ' || new_ct::STRING || ' new event(s)';
 END;
 $$;
 
 -- 1c. ACCOUNTADMIN session notifier.
+--     Same latency-safe + dedup pattern; event_key = query_id.
 CREATE OR REPLACE PROCEDURE SP_ALERT_ACCOUNTADMIN_QUERY()
 RETURNS STRING
 LANGUAGE SQL
 AS
 $$
 DECLARE
-    body STRING;
+    body    STRING;
+    new_ct  NUMBER;
 BEGIN
-    SELECT LISTAGG(
-        'User: '      || user_name
-        || ' | Query: ' || LEFT(query_text, 150)
-        || ' | Time: '  || start_time::STRING,
-        '\n'
-    )
-    INTO body
-    FROM snowflake.account_usage.query_history
-    WHERE role_name       = 'ACCOUNTADMIN'
-      AND execution_status = 'SUCCESS'
-      AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME();
+    CREATE OR REPLACE TEMPORARY TABLE _aa_new AS
+        SELECT qh.query_id AS event_key, qh.user_name, qh.query_text, qh.start_time
+        FROM snowflake.account_usage.query_history qh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_ACCOUNTADMIN_QUERY' AND s.event_key = qh.query_id
+        WHERE qh.role_name = 'ACCOUNTADMIN'
+          AND qh.execution_status = 'SUCCESS'
+          AND qh.start_time > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND qh.query_type NOT IN ('SHOW', 'DESCRIBE', 'USE')
+          AND s.event_key IS NULL;
+
+    SELECT COUNT(*) INTO new_ct FROM _aa_new;
+    IF (new_ct = 0) THEN
+        RETURN 'no new events';
+    END IF;
+
+    INSERT INTO GOVERNANCE.ACCESS_REVIEW.ALERT_STATE (alert_name, event_key)
+        SELECT 'ALERT_ACCOUNTADMIN_QUERY', event_key FROM _aa_new;
+
+    SELECT LISTAGG('User: ' || user_name || ' | Query: ' || LEFT(query_text, 150)
+                   || ' | Time: ' || start_time::STRING, '\n')
+    INTO body FROM _aa_new;
 
     CALL SYSTEM$SEND_EMAIL(
         'NI_SECURITY_EMAIL',
         '<security-team@example.com>',
         '[HIGH] Snowflake ACCOUNTADMIN Role Used for Query',
         'ACCOUNTADMIN should be reserved for break-glass only.'
-        || '  Verify the session is authorized.\n\n'
-        || COALESCE(body, '(no rows — possible false trigger)')
+        || '  Verify the session is authorized.\n\n' || body
     );
-    RETURN 'notified';
+    RETURN 'notified: ' || new_ct::STRING || ' new event(s)';
 END;
 $$;
 
@@ -165,17 +242,23 @@ $$;
 USE ROLE SYSADMIN;
 
 -- 2a. Break-glass login alert — poll every 5 minutes.
---     Condition: any successful login using the FR_BREAKGLASS role since the
---     last successful scheduled run of this alert.
+--     Condition: a NEW successful login by the break-glass USER within a
+--     latency-safe 3 h window (LOGIN_HISTORY has no role_name; break-glass is a
+--     dedicated user).  Not since-last-run — that misses late-arriving
+--     ACCOUNT_USAGE rows.  "New" = not already recorded in ALERT_STATE.
 CREATE OR REPLACE ALERT ALERT_BREAKGLASS_LOGIN
     WAREHOUSE = WH_ACCESS_REVIEW
     SCHEDULE  = '5 MINUTE'
     IF (EXISTS (
         SELECT 1
-        FROM snowflake.account_usage.login_history
-        WHERE role_name   = 'FR_BREAKGLASS'
-          AND is_success  = 'YES'
-          AND event_timestamp > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+        FROM snowflake.account_usage.login_history lh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_BREAKGLASS_LOGIN'
+         AND s.event_key  = MD5(lh.user_name || '|' || lh.event_timestamp::STRING)
+        WHERE lh.user_name ILIKE 'BREAKGLASS%'
+          AND lh.is_success  = 'YES'
+          AND lh.event_timestamp > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND s.event_key IS NULL
     ))
     THEN
         CALL GOVERNANCE.ACCESS_REVIEW.SP_ALERT_BREAKGLASS();
@@ -189,10 +272,14 @@ CREATE OR REPLACE ALERT ALERT_PHI_POLICY_DETACH
     SCHEDULE  = '10 MINUTE'
     IF (EXISTS (
         SELECT 1
-        FROM snowflake.account_usage.query_history
-        WHERE execution_status = 'SUCCESS'
-          AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
-          AND query_text ILIKE ANY (
+        FROM snowflake.account_usage.query_history qh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_PHI_CONTROL_TAMPER_POLICY_DETACH'
+         AND s.event_key  = qh.query_id
+        WHERE qh.execution_status = 'SUCCESS'
+          AND qh.start_time > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND s.event_key IS NULL
+          AND qh.query_text ILIKE ANY (
               '%UNSET MASKING POLICY%',
               '%UNSET ROW ACCESS POLICY%'
           )
@@ -208,12 +295,16 @@ CREATE OR REPLACE ALERT ALERT_PHI_TAG_UNSET
     SCHEDULE  = '10 MINUTE'
     IF (EXISTS (
         SELECT 1
-        FROM snowflake.account_usage.query_history
-        WHERE execution_status = 'SUCCESS'
-          AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+        FROM snowflake.account_usage.query_history qh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_PHI_CONTROL_TAMPER_TAG_REMOVAL'
+         AND s.event_key  = qh.query_id
+        WHERE qh.execution_status = 'SUCCESS'
+          AND qh.start_time > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND s.event_key IS NULL
           AND (
-              query_text ILIKE '%UNSET TAG%PII_STRING%'
-              OR query_text ILIKE '%UNSET TAG%PII_DATE%'
+              qh.query_text ILIKE '%UNSET TAG%PII_STRING%'
+              OR qh.query_text ILIKE '%UNSET TAG%PII_DATE%'
           )
     ))
     THEN
@@ -228,11 +319,15 @@ CREATE OR REPLACE ALERT ALERT_ACCOUNTADMIN_QUERY
     SCHEDULE  = '15 MINUTE'
     IF (EXISTS (
         SELECT 1
-        FROM snowflake.account_usage.query_history
-        WHERE role_name       = 'ACCOUNTADMIN'
-          AND execution_status = 'SUCCESS'
-          AND start_time > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
-          AND query_type NOT IN ('SHOW', 'DESCRIBE', 'USE')
+        FROM snowflake.account_usage.query_history qh
+        LEFT JOIN GOVERNANCE.ACCESS_REVIEW.ALERT_STATE s
+          ON s.alert_name = 'ALERT_ACCOUNTADMIN_QUERY'
+         AND s.event_key  = qh.query_id
+        WHERE qh.role_name       = 'ACCOUNTADMIN'
+          AND qh.execution_status = 'SUCCESS'
+          AND qh.start_time > DATEADD('hour', -3, CURRENT_TIMESTAMP())
+          AND qh.query_type NOT IN ('SHOW', 'DESCRIBE', 'USE')
+          AND s.event_key IS NULL
     ))
     THEN
         CALL GOVERNANCE.ACCESS_REVIEW.SP_ALERT_ACCOUNTADMIN_QUERY();

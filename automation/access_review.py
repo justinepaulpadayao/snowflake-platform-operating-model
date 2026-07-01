@@ -144,10 +144,33 @@ def reconcile(
     stale_days: int = DEFAULT_STALE_DAYS,
     key_rotation_days: int = KEY_ROTATION_DAYS,
     today: dt.date | None = None,
+    managed_roles: set[str] | None = None,
 ) -> list[Exception_]:
-    """Set diff + identity checks -> exceptions. Pure function."""
+    """Set diff + identity checks -> exceptions. Pure function.
+
+    `actual` is the EFFECTIVE grant set from actual_grants() — it includes roles
+    reached by inheritance (AR_* access roles, SCIM group-roles) so that
+    under-provisioning is not falsely raised for SCIM users whose FR_* role
+    arrives via a group-role. But those inherited AR_/group roles are an
+    implementation detail: they are not in the assignable policy vocabulary, so
+    diffing the full closure against an FR_-only `expected` would flag every one
+    of them as OVER_PROVISIONED (some as CRITICAL). `managed_roles` restricts the
+    over/under diff to the assignable vocabulary (FR_* + service expected_roles);
+    pass it in production. When None, the raw closure is compared (used by unit
+    tests that build small explicit sets).
+
+    Boundary: a role granted DIRECTLY to a user but outside the managed
+    vocabulary (e.g. someone hand-grants AR_PHI_UNMASK on its own) is not caught
+    by this diff; direct grants of sensitive roles are a separate check (a
+    production enhancement noted in the review).
+    """
     today = today or dt.date.today()
     out: list[Exception_] = []
+    actual_cmp = (
+        {g for g in actual if g.role in managed_roles}
+        if managed_roles is not None
+        else actual
+    )
 
     def mk(kind, identity, role, detail):
         sev = SEVERITY[kind]
@@ -162,7 +185,7 @@ def reconcile(
             exc.rollback_sql = f"GRANT ROLE {_q(role)} TO USER {_q(identity)};"
         return exc
 
-    for g in actual - expected:  # over-provisioned
+    for g in actual_cmp - expected:  # over-provisioned
         out.append(
             mk(
                 "OVER_PROVISIONED",
@@ -171,7 +194,7 @@ def reconcile(
                 "Grant present in Snowflake but not authorized by policy.",
             )
         )
-    for g in expected - actual:  # under-provisioned
+    for g in expected - actual_cmp:  # under-provisioned
         out.append(
             mk(
                 "UNDER_PROVISIONED",
@@ -466,6 +489,11 @@ def run(
 
     actual = sf.actual_grants()
     expected, sensitivity = build_expected(role_matrix, group_membership, svc_inventory)
+    # Assignable policy vocabulary: the FR_* roles the matrix maps to Entra
+    # groups plus every service account's expected roles. actual_grants() returns
+    # the full inheritance closure, so we restrict the over/under diff to this
+    # vocabulary — otherwise inherited AR_*/group roles read as OVER_PROVISIONED.
+    managed_roles = {g.role for g in expected}
     exceptions = reconcile(
         actual,
         expected,
@@ -474,6 +502,7 @@ def run(
         sensitivity,
         args.stale_days,
         args.key_rotation_days,
+        managed_roles=managed_roles,
     )
 
     run_id = args.run_id

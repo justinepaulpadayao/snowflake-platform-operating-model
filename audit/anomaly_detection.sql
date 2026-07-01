@@ -39,19 +39,17 @@
    Exclude automated service accounts (they have predictable, large volumes);
    focus on human FR_* role sessions.
    ============================================================================ */
--- ACCESS_HISTORY tracks which objects were accessed (and by whom), but does
--- not carry rows_produced.  That metric lives in QUERY_HISTORY.  We join on
--- query_id so we can filter to PHI-role sessions in ACCESS_HISTORY while
--- summing the row count from QUERY_HISTORY.
+-- rows_produced lives in QUERY_HISTORY, which is one row per query — no join
+-- to ACCESS_HISTORY is needed here (this signal is overall volume, not PHI-
+-- scoped).  Sections 2/4/5 add the ACCESS_HISTORY join only to scope to PHI
+-- objects, and dedupe to query grain so the object fan-out does not inflate
+-- the row count.
 WITH daily_volume AS (
     SELECT
         qh.user_name,
         DATE(qh.start_time)    AS query_date,
         SUM(qh.rows_produced)  AS rows_produced_day
     FROM snowflake.account_usage.query_history qh
-    INNER JOIN snowflake.account_usage.access_history ah
-        ON qh.query_id = ah.query_id
-       AND qh.start_time = ah.query_start_time
     WHERE qh.start_time >= DATEADD('day', -8, CURRENT_TIMESTAMP())
       -- Snowflake rejects `x NOT ILIKE ANY (...)`; negate the whole predicate.
       AND NOT (qh.user_name ILIKE ANY ('SVC_%', '%_SVC', 'BREAKGLASS_%'))
@@ -95,22 +93,35 @@ ORDER BY multiple_of_baseline DESC;
    human is uncommon; a volume spike off-hours is a stronger signal than
    either indicator alone.
    ============================================================================ */
-WITH phi_sessions AS (
-    SELECT
-        ah.user_name,
-        ah.query_start_time,
-        HOUR(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', ah.query_start_time)) AS hour_local,
-        DAYOFWEEK(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', ah.query_start_time))           AS dow,
-        SUM(qh.rows_produced) AS rows_produced   -- rows_produced lives in QUERY_HISTORY
-    FROM snowflake.account_usage.access_history ah
-    INNER JOIN snowflake.account_usage.query_history qh
-        ON ah.query_id = qh.query_id
-       AND ah.query_start_time = qh.start_time,
+-- Dedupe to one row per query FIRST: LATERAL FLATTEN fans a query into one row
+-- per accessed object, so aggregating rows_produced across the flattened set
+-- would multiply the count by the number of PHI objects the query touched.
+-- We use DISTINCT query_id to collapse back to query grain before summing.
+WITH phi_queries AS (
+    SELECT DISTINCT
+        qh.query_id,
+        qh.user_name,
+        qh.start_time,
+        qh.rows_produced
+    FROM snowflake.account_usage.query_history qh
+    INNER JOIN snowflake.account_usage.access_history ah
+        ON qh.query_id = ah.query_id
+       AND qh.start_time = ah.query_start_time,
     LATERAL FLATTEN(input => ah.base_objects_accessed) f
-    WHERE ah.query_start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
+    WHERE qh.start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
       AND f.value:objectName::string ILIKE 'RAW_MASKED.GOV.%'
-      AND NOT (ah.user_name ILIKE ANY ('SVC_%', 'BREAKGLASS_%'))
-    GROUP BY ah.user_name, ah.query_start_time, hour_local, dow
+      AND NOT (qh.user_name ILIKE ANY ('SVC_%', 'BREAKGLASS_%'))
+),
+
+phi_sessions AS (
+    SELECT
+        user_name,
+        start_time AS query_start_time,
+        HOUR(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', start_time)) AS hour_local,
+        DAYOFWEEK(CONVERT_TIMEZONE('<YOUR_TIMEZONE>', start_time)) AS dow,
+        SUM(rows_produced) AS rows_produced
+    FROM phi_queries
+    GROUP BY user_name, start_time, hour_local, dow
 )
 
 SELECT
@@ -174,10 +185,13 @@ ORDER BY r.first_seen_recent DESC;
    Threshold: 10 000 rows in a single query (EDIT to a value appropriate for
    your dataset size).
    ============================================================================ */
-SELECT
+-- SELECT DISTINCT collapses the object fan-out so one mass-export query is
+-- reported once, not once per PHI object it touched.  rows_produced comes from
+-- QUERY_HISTORY (ACCESS_HISTORY has no row count).
+SELECT DISTINCT
     ah.user_name,
     ah.query_start_time,
-    qh.rows_produced,              -- rows_produced lives in QUERY_HISTORY, not ACCESS_HISTORY
+    qh.rows_produced,
     LEFT(qh.query_text, 300)   AS query_text_excerpt,
     qh.query_id,
     'MASS_EXPORT'              AS signal
@@ -201,12 +215,15 @@ ORDER BY qh.rows_produced DESC;
    This query detects users with > 10 zero-row queries on PHI tables in a day
    (EDIT the threshold).
    ============================================================================ */
-WITH phi_queries AS (
-    SELECT
+-- Dedupe to query grain FIRST (see section 2): COUNT(*) / SUM over the
+-- flattened set would count objects-touched, not queries.  DISTINCT query_id
+-- collapses the fan-out so total_queries and zero_row_queries are per-query.
+WITH phi_query_grain AS (
+    SELECT DISTINCT
+        qh.query_id,
         qh.user_name,
-        DATE(qh.start_time)   AS query_date,
-        COUNT(*)              AS total_queries,
-        SUM(CASE WHEN qh.rows_produced = 0 THEN 1 ELSE 0 END) AS zero_row_queries
+        qh.start_time,
+        qh.rows_produced
     FROM snowflake.account_usage.query_history qh
     INNER JOIN snowflake.account_usage.access_history ah
         ON qh.query_id = ah.query_id
@@ -214,7 +231,16 @@ WITH phi_queries AS (
     LATERAL FLATTEN(input => ah.base_objects_accessed) f
     WHERE qh.start_time >= DATEADD('day', -30, CURRENT_TIMESTAMP())
       AND f.value:objectName::string ILIKE 'RAW_MASKED.GOV.%'
-    GROUP BY qh.user_name, DATE(qh.start_time)
+),
+
+phi_queries AS (
+    SELECT
+        user_name,
+        DATE(start_time)  AS query_date,
+        COUNT(*)          AS total_queries,
+        SUM(CASE WHEN rows_produced = 0 THEN 1 ELSE 0 END) AS zero_row_queries
+    FROM phi_query_grain
+    GROUP BY user_name, DATE(start_time)
 )
 
 SELECT
