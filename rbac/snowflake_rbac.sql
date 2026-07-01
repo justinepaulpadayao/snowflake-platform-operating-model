@@ -127,22 +127,50 @@ CREATE TAG IF NOT EXISTS RAW_MASKED.GOV.PII_DATE
     COMMENT = 'Date PHI (DOB, admit/discharge) -> date generalization';
 
 -- 3b. Masking policies (one per data type) ------------------------------------
--- IS_ROLE_IN_SESSION is hierarchy-aware (accounts for inherited roles).
+-- PREDICATE CHOICE: IS_GRANTED_TO_INVOKER_ROLE (not IS_ROLE_IN_SESSION).
+--   IS_GRANTED_TO_INVOKER_ROLE evaluates ONLY the invoker's PRIMARY role and its
+--   inheritance -- it excludes activated SECONDARY roles. IS_ROLE_IN_SESSION also
+--   counts secondary roles, so under `USE SECONDARY ROLES ALL` (the Snowsight
+--   default) a user who holds AR_PHI_UNMASK merely as a secondary role would see
+--   cleartext PHI. For a PHI gate we want the fail-closed, primary-role-only
+--   semantics. Verified live: with the unmask role active only as a SECONDARY
+--   role the column stays REDACTED; it unmasks when reached through the PRIMARY
+--   role's inheritance. See governance/adr_phi_masking_predicate.md.
+-- OPERATIONAL DEPENDENCY: PHI-cleared users MUST have DEFAULT_ROLE set to the
+--   role that carries AR_PHI_UNMASK (FR_CLINICAL_ANALYTICS) so the unmask role is
+--   their PRIMARY role at query time. SCIM does not set DEFAULT_ROLE; it is set
+--   out-of-band (Section 11). DEFAULT_SECONDARY_ROLES = ('ALL') does NOT satisfy
+--   this predicate -- auto-activated secondaries are exactly what it ignores.
+-- DEPLOY NOTE: a masking policy already ATTACHED to a tag/column cannot be
+--   CREATE OR REPLACE'd (Snowflake: "associated with one or more entities").
+--   The CREATE ... IF NOT EXISTS handles a fresh account; the ALTER ... SET BODY
+--   immediately after enforces/updates the predicate IN PLACE on any re-run or
+--   when migrating an existing deployment off the older IS_ROLE_IN_SESSION body.
 CREATE MASKING POLICY IF NOT EXISTS RAW_MASKED.GOV.MP_PHI_STRING
     AS (val STRING) RETURNS STRING ->
         CASE
-            WHEN IS_ROLE_IN_SESSION('AR_PHI_UNMASK') THEN val
+            WHEN IS_GRANTED_TO_INVOKER_ROLE('AR_PHI_UNMASK') THEN val
             ELSE '***REDACTED***'
         END
-    COMMENT = 'Masks string PHI unless session holds AR_PHI_UNMASK';
+    COMMENT = 'Masks string PHI unless the invoker PRIMARY role holds AR_PHI_UNMASK';
+ALTER MASKING POLICY RAW_MASKED.GOV.MP_PHI_STRING SET BODY ->
+    CASE
+        WHEN IS_GRANTED_TO_INVOKER_ROLE('AR_PHI_UNMASK') THEN val
+        ELSE '***REDACTED***'
+    END;
 
 CREATE MASKING POLICY IF NOT EXISTS RAW_MASKED.GOV.MP_PHI_DATE
     AS (val DATE) RETURNS DATE ->
         CASE
-            WHEN IS_ROLE_IN_SESSION('AR_PHI_UNMASK') THEN val
+            WHEN IS_GRANTED_TO_INVOKER_ROLE('AR_PHI_UNMASK') THEN val
             ELSE DATE_FROM_PARTS(YEAR(val), 1, 1)  -- generalize to Jan-1 of year
         END
-    COMMENT = 'Generalizes DOB unless session holds AR_PHI_UNMASK';
+    COMMENT = 'Generalizes DOB unless the invoker PRIMARY role holds AR_PHI_UNMASK';
+ALTER MASKING POLICY RAW_MASKED.GOV.MP_PHI_DATE SET BODY ->
+    CASE
+        WHEN IS_GRANTED_TO_INVOKER_ROLE('AR_PHI_UNMASK') THEN val
+        ELSE DATE_FROM_PARTS(YEAR(val), 1, 1)
+    END;
 
 -- 3c. Tag-based masking: attach policy to the TAG, not each column. Any column
 --     carrying the tag (now or in future) inherits the mask automatically.
@@ -157,17 +185,36 @@ CREATE TABLE IF NOT EXISTS RAW_MASKED.GOV.ROW_ENTITLEMENTS (
 
 -- The argument is named distinctly (arg_facility_id) so the correlated subquery
 -- cannot accidentally resolve `facility_id` to ROW_ENTITLEMENTS.facility_id.
+--
+-- PREDICATE CHOICE (deliberate, and different from the masking policies above):
+--   Row-access uses IS_ROLE_IN_SESSION; masking uses IS_GRANTED_TO_INVOKER_ROLE.
+--   This is NOT an oversight. The entitlement branch is DATA-DRIVEN -- it checks
+--   a role name pulled from a column (e.role_name) -- and IS_GRANTED_TO_INVOKER_ROLE
+--   accepts only a STRING LITERAL argument (verified live: a column argument
+--   raises "invalid argument for function"). So the invoker-role predicate cannot
+--   express a table-driven entitlement check; IS_ROLE_IN_SESSION is the only
+--   option here.
+--   Coherence: this makes row visibility (secondary-role-aware) potentially
+--   BROADER than column visibility (primary-role-only). The mismatch FAILS CLOSED
+--   -- the only possible divergence is "rows visible, PHI columns still masked",
+--   never the reverse -- so it cannot leak PHI. And once PHI-cleared users carry
+--   DEFAULT_ROLE = FR_CLINICAL_ANALYTICS (Section 11), the clinical role is their
+--   PRIMARY role and both predicates agree, so the distinction is moot on the
+--   intended path. See governance/adr_phi_masking_predicate.md.
 CREATE ROW ACCESS POLICY IF NOT EXISTS RAW_MASKED.GOV.RAP_FACILITY
     AS (arg_facility_id STRING) RETURNS BOOLEAN ->
         -- Full-row roles: platform admin, break-glass, and dbt (transforms must
         -- read every row of source; they operate on already-masked columns).
+        -- These are deterministic-primary identities (service users / a named
+        -- break-glass user with a fixed DEFAULT_ROLE), so IS_ROLE_IN_SESSION and
+        -- primary-role semantics coincide for them.
         IS_ROLE_IN_SESSION('FR_PLATFORM_ADMIN')
         OR IS_ROLE_IN_SESSION('FR_BREAKGLASS')
         OR IS_ROLE_IN_SESSION('FR_DBT_TRANSFORM')
         OR EXISTS (
             SELECT 1 FROM RAW_MASKED.GOV.ROW_ENTITLEMENTS e
             WHERE e.facility_id = arg_facility_id
-              AND IS_ROLE_IN_SESSION(e.role_name)
+              AND IS_ROLE_IN_SESSION(e.role_name)  -- must be a column; invoker-role fn rejects non-literals
         )
     COMMENT = 'Row-level facility entitlement for PHI tables';
 
@@ -423,6 +470,18 @@ GRANT ROLE FR_BREAKGLASS TO USER BREAKGLASS_01;
 -- GRANT ROLE FR_ANALYST            TO ROLE "AAD-SF-GENERAL-ANALYSTS";
 -- Break-glass is assigned to a named user out-of-band, never mapped to a group.
 
+-- REQUIRED for PHI unmasking: the masking policies use IS_GRANTED_TO_INVOKER_ROLE,
+-- which only honors the invoker's PRIMARY role. A clinical analyst who also sits
+-- in another group (e.g. general analyst / BI) may have FR_CLINICAL_ANALYTICS
+-- activated only as a SECONDARY role, in which case PHI is masked FROM THEM. SCIM
+-- provisions role grants but does NOT set DEFAULT_ROLE, so it must be set
+-- out-of-band for every PHI-cleared user so the clinical role is their PRIMARY:
+-- ALTER USER "<clinician_login>" SET DEFAULT_ROLE = FR_CLINICAL_ANALYTICS;
+-- Snowsight/interactive fallback: run `USE ROLE FR_CLINICAL_ANALYTICS;` before
+-- querying PHI. NOTE: DEFAULT_SECONDARY_ROLES = ('ALL') does NOT help here --
+-- auto-activated secondary roles are exactly what the invoker predicate ignores.
+-- Driver/Power BI/dbt connections set the role explicitly, so they are unaffected.
+
 
 /* ============================================================================
    SECTION 12 -- APPLY PHI PROTECTION TO A SAMPLE TABLE (illustrative)
@@ -465,6 +524,19 @@ ALTER TABLE RAW_MASKED.GOV.PATIENT
 -- SHOW GRANTS TO USER SVC_DBT;
 -- SELECT * FROM TABLE(INFORMATION_SCHEMA.POLICY_REFERENCES(
 --     REF_ENTITY_NAME => 'RAW_MASKED.GOV.PATIENT', REF_ENTITY_DOMAIN => 'TABLE'));
+--
+-- PHI UNMASK -- MUST test BOTH role-activation modes (the masking predicate is
+-- primary-role-only, so activation mode is the variable that decides the result):
+--   (a) clinical role as PRIMARY  -> expect CLEARTEXT PHI:
+--         USE ROLE FR_CLINICAL_ANALYTICS; USE SECONDARY ROLES NONE;
+--         SELECT full_name, mrn, dob FROM RAW_MASKED.GOV.PATIENT;   -- real values
+--   (b) clinical role as SECONDARY under a non-PHI primary -> expect MASKED
+--       (this is the misconfiguration that DEFAULT_ROLE prevents):
+--         USE ROLE FR_ANALYST; USE SECONDARY ROLES ALL;
+--         SELECT full_name, mrn, dob FROM RAW_MASKED.GOV.PATIENT;   -- ***REDACTED***
+--   (c) ACCOUNTADMIN / break-glass -> expect MASKED (no admin bypass).
+-- Post-cutover, monitor for a spike in ***REDACTED*** / Jan-1 dates returned to
+-- clinical analysts -- that is the early signal that DEFAULT_ROLE was not set.
 
 
 /* ============================================================================
@@ -478,12 +550,18 @@ ALTER TABLE RAW_MASKED.GOV.PATIENT
       roles; nothing legacy is revoked yet.
    2. ADDITIVE GRANT: map Entra groups (or a pilot cohort) to the new FR_* roles
       in addition to legacy access. Existing access keeps working.
-   3. VERIFY: pilot users/services run under FR_* roles; confirm masking
-      (general analyst sees '***REDACTED***', clinical analyst sees real values),
-      row-access, and dbt/Power BI key-pair auth. Diff new vs legacy effective
-      privileges via ACCOUNT_USAGE.GRANTS_TO_ROLES.
-   4. CUTOVER: switch Entra group membership / default roles to FR_*. Monitor
-      LOGIN_HISTORY / QUERY_HISTORY for failures over a soak period.
+   3. VERIFY: pilot users/services run under FR_* roles; confirm masking,
+      row-access, and dbt/Power BI key-pair auth. For masking, test BOTH modes
+      (see Section 13): clinical role as PRIMARY -> cleartext; clinical role as a
+      SECONDARY under a non-PHI primary -> ***REDACTED*** (proves the invoker
+      predicate + why DEFAULT_ROLE matters). A soak that only tests the clinical
+      role as primary WILL pass and then break in production for multi-group
+      users on secondaries -- test the secondary case explicitly. Diff new vs
+      legacy effective privileges via ACCOUNT_USAGE.GRANTS_TO_ROLES.
+   4. CUTOVER: switch Entra group membership to FR_*, AND set DEFAULT_ROLE =
+      FR_CLINICAL_ANALYTICS for every PHI-cleared user (SCIM will not). Monitor
+      LOGIN_HISTORY / QUERY_HISTORY for failures, and QUERY_HISTORY for a spike
+      in masked PHI returned to clinical analysts, over a soak period.
    5. REVOKE LEGACY LAST (reversible): revoke legacy roles from users, then
       groups; keep legacy roles defined (empty) for the rollback window.
    ROLLBACK at any step: re-grant the still-defined legacy role to the affected
